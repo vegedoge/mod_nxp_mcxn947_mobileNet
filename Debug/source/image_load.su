@@ -1,2 +1,0 @@
-../source/image_load.c:17:10:IMAGE_GetImage	32	static
-../source/image_load.c:36:13:IMAGE_GetImageName	4	static
