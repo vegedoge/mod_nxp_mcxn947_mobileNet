@@ -36,6 +36,18 @@ int main(void)
     tensor_type_t outputType;
     uint8_t* outputData = MODEL_GetOutputTensorData(&outputDims, &outputType);
 
+    // ============ Print model info ============
+    PRINTF("--- TFLite model info ---\r\n");
+    PRINTF("Input B: %d, H: %d, W: %d, C: %d\n", 
+        inputDims.data[0], inputDims.data[1], inputDims.data[2], inputDims.data[3]);
+    PRINTF("Input type: %d (9=kTfLiteInt8)\n", inputType); // 9 is kTfLiteInt8
+
+    PRINTF("Output B: %d, Classes: %d\n", 
+        outputDims.data[0], outputDims.data[1]);
+    PRINTF("Output type: %d (9=kTfLiteInt8)\n", outputType);
+    PRINTF("--------------------------\r\n");
+    // ========================================
+
     while (1)
     {
         /* Expected tensor dimensions: [batches, height, width, channels] */
