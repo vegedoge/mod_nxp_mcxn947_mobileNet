@@ -40,11 +40,11 @@ int main(void)
     PRINTF("--- TFLite model info ---\r\n");
     PRINTF("Input B: %d, H: %d, W: %d, C: %d\n", 
         inputDims.data[0], inputDims.data[1], inputDims.data[2], inputDims.data[3]);
-    PRINTF("Input type: %d (9=kTfLiteInt8)\n", inputType); // 9 is kTfLiteInt8
+    PRINTF("Input type: %d (0=kTfLiteFloat32, 1=kTfLiteUint8, 2=kTfLiteInt8)\n", inputType); // 9 is kTfLiteInt8
 
     PRINTF("Output B: %d, Classes: %d\n", 
         outputDims.data[0], outputDims.data[1]);
-    PRINTF("Output type: %d (9=kTfLiteInt8)\n", outputType);
+    PRINTF("Output type: %d (0=kTfLiteFloat32, 1=kTfLiteUint8, 2=kTfLiteInt8)\n", outputType);
     PRINTF("--------------------------\r\n");
     // ========================================
 
