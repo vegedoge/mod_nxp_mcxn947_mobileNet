@@ -4,3 +4,4 @@ Debug
 .vscode
 *Debug.launch
 *Release.launch
+.cproject
