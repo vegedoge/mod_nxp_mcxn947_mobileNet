@@ -26,6 +26,13 @@ limitations under the License.
 #include "model.h"
 #include "model_data.h"
 
+// modules for profiling
+#include "tensorflow/lite/micro/micro_profiler.h"
+
+extern "C" void TFLM_Timer_Init();
+
+static tflite::MicroProfiler s_profiler;
+
 static const tflite::Model* s_model = nullptr;
 static tflite::MicroInterpreter* s_interpreter = nullptr;
 
@@ -42,6 +49,7 @@ static uint8_t s_tensorArena[kTensorArenaSize] __ALIGNED(16);
 static uint32_t s_tensorArenaSizeUsed = 0;
 status_t MODEL_Init(void)
 {
+    TFLM_Timer_Init();
     // Map the model into a usable data structure. This doesn't involve any
     // copying or parsing, it's a very lightweight operation.
     s_model = tflite::GetModel(model_data);
@@ -59,11 +67,15 @@ status_t MODEL_Init(void)
     tflite::MicroOpResolver &micro_op_resolver = MODEL_GetOpsResolver();
 
     // Build an interpreter to run the model with.
+    // static tflite::MicroInterpreter static_interpreter(
+    //     s_model, micro_op_resolver, s_tensorArena, kTensorArenaSize);
+
+    // here we added profiler
     static tflite::MicroInterpreter static_interpreter(
-        s_model, micro_op_resolver, s_tensorArena, kTensorArenaSize);
+        s_model, micro_op_resolver, s_tensorArena, kTensorArenaSize, nullptr, &s_profiler);
     s_interpreter = &static_interpreter;
  
- // Allocate memory from the tensor_arena for the model's tensors.
+    // Allocate memory from the tensor_arena for the model's tensors.
     TfLiteStatus allocate_status = s_interpreter->AllocateTensors();
     if (allocate_status != kTfLiteOk)
     {
@@ -93,11 +105,18 @@ status_t MODEL_Init(void)
 
 status_t MODEL_RunInference(void)
 {
+    // profiling here
+    s_profiler.ClearEvents();
+
     if (s_interpreter->Invoke() != kTfLiteOk)
     {
         PRINTF("Invoke failed!\r\n");
         return kStatus_Fail;
     }
+
+    PRINTF("--- Operator Profiling Results ---\r\n");
+    s_profiler.Log();
+    PRINTF("--- Profiling Ends ---\r\n");
 
     return kStatus_Success;
 }
