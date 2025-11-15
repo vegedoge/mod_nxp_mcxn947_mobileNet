@@ -27,11 +27,12 @@ limitations under the License.
 #include "model_data.h"
 
 // modules for profiling
-#include "tensorflow/lite/micro/micro_profiler.h"
+// the original tflm profiler can not stick to the NXP timer functions
+// so we implement our own profiler based on tflm profiler interface
+#include "custom_tflm_profiler.h"
 
-extern "C" void TFLM_Timer_Init();
-
-static tflite::MicroProfiler s_profiler;
+// static tflite::MicroProfiler s_profiler;
+static CustomProfiler s_custom_profiler;
 
 static const tflite::Model* s_model = nullptr;
 static tflite::MicroInterpreter* s_interpreter = nullptr;
@@ -70,9 +71,9 @@ status_t MODEL_Init(void)
     // static tflite::MicroInterpreter static_interpreter(
     //     s_model, micro_op_resolver, s_tensorArena, kTensorArenaSize);
 
-    // here we added profiler
+    // here we added out own profiler
     static tflite::MicroInterpreter static_interpreter(
-        s_model, micro_op_resolver, s_tensorArena, kTensorArenaSize, nullptr, &s_profiler);
+        s_model, micro_op_resolver, s_tensorArena, kTensorArenaSize, nullptr, &s_custom_profiler);
     s_interpreter = &static_interpreter;
  
     // Allocate memory from the tensor_arena for the model's tensors.
@@ -105,8 +106,6 @@ status_t MODEL_Init(void)
 
 status_t MODEL_RunInference(void)
 {
-    // profiling here
-    s_profiler.ClearEvents();
 
     if (s_interpreter->Invoke() != kTfLiteOk)
     {
@@ -115,7 +114,7 @@ status_t MODEL_RunInference(void)
     }
 
     PRINTF("--- Operator Profiling Results ---\r\n");
-    s_profiler.Log();
+    s_custom_profiler.LogResults();
     PRINTF("--- Profiling Ends ---\r\n");
 
     return kStatus_Success;
