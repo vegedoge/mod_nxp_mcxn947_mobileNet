@@ -6,6 +6,7 @@
  */
 
 #include "custom_int4_unpack.h"
+#include "custom_depthwise_conv_int4.h"
 
 #include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/c/builtin_op_data.h"
@@ -23,7 +24,7 @@ namespace tflite {
   namespace {
 
     // Opdata: to pass precomputed params between Prepare and Eval
-    struct OpData {
+    struct DepthwiseOpData {
       TfLitePaddingValues padding;
 
       // Quantization parameters
@@ -38,14 +39,14 @@ namespace tflite {
     };
 
     // Util: assign OpData
-    void* Init(TfLiteContext* context, const char* buffer, size_t length) {
+    void* DepthwiseInit_INT4(TfLiteContext* context, const char* buffer, size_t length) {
       return context->AllocatePersistentBuffer(
-          context, sizeof(OpData));
+          context, sizeof(DepthwiseOpData));
     }
 
     // Prepare : compute quantization params and padding
-    TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
-      OpData *data = static_cast<OpData *>(node->user_data);
+    TfLiteStatus DepthwisePrepare_INT4(TfLiteContext* context, TfLiteNode* node) {
+      DepthwiseOpData *data = static_cast<DepthwiseOpData *>(node->user_data);
 
       TF_LITE_ENSURE_EQ(context, NumInputs(node), 3);   // input, filter, bias
       TF_LITE_ENSURE_EQ(context, NumOutputs(node), 1);
@@ -118,8 +119,8 @@ namespace tflite {
     }
 
     // Custom Eval function to handle packed INT4 weights
-    TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
-      const OpData* data = static_cast<const OpData *>(node->user_data);
+    TfLiteStatus DepthwiseEval_INT4(TfLiteContext* context, TfLiteNode* node) {
+      const DepthwiseOpData* data = static_cast<const DepthwiseOpData *>(node->user_data);
       const auto* params = reinterpret_cast<const TfLiteDepthwiseConvParams*>(node->builtin_data);
       
       // --- get input tensors, params ---
@@ -213,7 +214,7 @@ namespace tflite {
   }
 
   TFLMRegistration Register_CUSTOM_DEPTHWISE_CONV_INT4() {
-    return tflite::micro::RegisterOp(Init, Prepare, Eval);
+    return tflite::micro::RegisterOp(DepthwiseInit_INT4, DepthwisePrepare_INT4, DepthwiseEval_INT4);
   }
 
 }

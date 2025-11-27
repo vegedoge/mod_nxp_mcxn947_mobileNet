@@ -5,6 +5,7 @@
  *      Author: yx_wu
  */
 #include "custom_int4_unpack.h"
+#include "custom_conv_int4.h"
 
 #include "tensorflow/lite/c/builtin_op_data.h"
 #include "tensorflow/lite/c/common.h"
@@ -20,7 +21,7 @@ namespace tflite {
   namespace {
 
     // Opdata: to pass precomputed params between Prepare and Eval
-    struct OpData {
+    struct ConvOpData {
       TfLitePaddingValues padding;
 
       // Quantization parameters
@@ -34,21 +35,21 @@ namespace tflite {
       int32_t output_activation_max;
     };
 
-    void* Init(TfLiteContext* context, const char* buffer, size_t length) {
+    void* ConvInit_INT4(TfLiteContext* context, const char* buffer, size_t length) {
       return context->AllocatePersistentBuffer(
-          context, sizeof(OpData));
+          context, sizeof(ConvOpData));
     }
 
     // Prepare
-    TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
-      OpData* data = static_cast<OpData *>(node->user_data);
+    TfLiteStatus ConvPrepare_INT4(TfLiteContext* context, TfLiteNode* node) {
+      ConvOpData* data = static_cast<ConvOpData *>(node->user_data);
 
       TF_LITE_ENSURE_EQ(context, NumInputs(node), 3);   // input, filter, bias
       TF_LITE_ENSURE_EQ(context, NumOutputs(node), 1);
 
       const TfLiteTensor* input = GetInput(context, node, 0);
       const TfLiteTensor* filter = GetInput(context, node, 1);
-      const TfLiteTensor* output = GetOutput(context, node, 0);
+      TfLiteTensor* output = GetOutput(context, node, 0);
 
       const auto* params = reinterpret_cast<const TfLiteConvParams*>(node->builtin_data);
 
@@ -111,8 +112,8 @@ namespace tflite {
     }
 
     // Eval
-    TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
-      const OpData *data = static_cast<const OpData *>(node->user_data);
+    TfLiteStatus ConvEval_INT4(TfLiteContext* context, TfLiteNode* node) {
+      const ConvOpData *data = static_cast<const ConvOpData *>(node->user_data);
       const auto *params = reinterpret_cast<const TfLiteConvParams *>(node->builtin_data);
 
       const TfLiteEvalTensor* input = tflite::micro::GetEvalInput(context, node, 0);
@@ -217,9 +218,9 @@ namespace tflite {
     }
 
   }   // namespace
-  
+
   TFLMRegistration Register_CUSTOM_CONV_INT4() {
-    return tflite::micro::RegisterOp(Init, Prepare, Eval);
+    return tflite::micro::RegisterOp(ConvInit_INT4, ConvPrepare_INT4, ConvEval_INT4);
   }
 
 } // namespace tflite
