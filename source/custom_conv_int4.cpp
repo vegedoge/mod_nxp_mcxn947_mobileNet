@@ -7,26 +7,37 @@
 #include "custom_int4_unpack.h"
 #include "custom_conv_int4.h"
 
-#include "tensorflow/lite/c/builtin_op_data.h"
-#include "tensorflow/lite/c/common.h"
-#include "tensorflow/lite/kernels/internal/common.h"
+// TFLM
+#include "tensorflow/lite/micro/kernels/kernel_util.h"
 #include "tensorflow/lite/kernels/internal/quantization_util.h"
 #include "tensorflow/lite/kernels/internal/reference/integer_ops/conv.h"
+#include "tensorflow/lite/micro/micro_context.h"
+
+// TFLite
+#include "tensorflow/lite/kernels/internal/common.h"
 #include "tensorflow/lite/kernels/internal/tensor_ctypes.h"
 #include "tensorflow/lite/kernels/kernel_util.h"
 #include "tensorflow/lite/kernels/padding.h"
-#include "tensorflow/lite/micro/kernels/kernel_util.h"
+#include "tensorflow/lite/c/builtin_op_data.h"
+#include "tensorflow/lite/c/common.h"
+
 
 namespace tflite {
   namespace {
+
+    #define MAX_CONV_CHANNELS 512 // alpha = 0.25
 
     // Opdata: to pass precomputed params between Prepare and Eval
     struct ConvOpData {
       TfLitePaddingValues padding;
 
-      // Quantization parameters
-      int32_t* per_channel_output_multiplier;
-      int* per_channel_output_shift;
+      // Quantization parameters (dynamic allocation)
+      int32_t* per_channel_output_multiplier = nullptr;
+      int* per_channel_output_shift = nullptr;
+
+      // static allocation
+      // int32_t per_channel_output_multiplier[MAX_CONV_CHANNELS];
+      // int per_channel_output_shift[MAX_CONV_CHANNELS];
 
       // common params
       int32_t output_offset;
@@ -36,20 +47,50 @@ namespace tflite {
     };
 
     void* ConvInit_INT4(TfLiteContext* context, const char* buffer, size_t length) {
-      return context->AllocatePersistentBuffer(
-          context, sizeof(ConvOpData));
+      // return context->AllocatePersistentBuffer(context, sizeof(ConvOpData));
+      // void* raw = context->AllocatePersistentBuffer(context, sizeof(ConvOpData));
+      // ConvOpData* data = static_cast<ConvOpData*>(raw);
+      // if (data) {
+      //   data->per_channel_output_multiplier = nullptr;
+      //   data->per_channel_output_shift = nullptr;
+      // }
+      // return raw;
+
+      return context->AllocatePersistentBuffer(context, sizeof(ConvOpData));
     }
+      
 
     // Prepare
     TfLiteStatus ConvPrepare_INT4(TfLiteContext* context, TfLiteNode* node) {
       ConvOpData* data = static_cast<ConvOpData *>(node->user_data);
 
-      TF_LITE_ENSURE_EQ(context, NumInputs(node), 3);   // input, filter, bias
-      TF_LITE_ENSURE_EQ(context, NumOutputs(node), 1);
+      // check OpData
+      if (data == nullptr) {
+          printf("Error: OpData is null in Prepare! Init failed?\r\n");
+          return kTfLiteError;
+      }
 
-      const TfLiteTensor* input = GetInput(context, node, 0);
-      const TfLiteTensor* filter = GetInput(context, node, 1);
-      TfLiteTensor* output = GetOutput(context, node, 0);
+      // // we now allow 2 or 3 inputs (bias is optional)
+      TF_LITE_ENSURE(context, node->inputs->size == 2 || node->inputs->size == 3);
+      TF_LITE_ENSURE_EQ(context, node->outputs->size, 1);
+
+      // Get micro context(this is where needs to be freed later)
+      MicroContext* micro_context = GetMicroContext(context);
+
+      // directly GetTensor to access quantization params
+      // const TfLiteTensor *input = context->GetTensor(context, node->inputs->data[0]);
+      TfLiteTensor* input = micro_context->AllocateTempTfLiteTensor(node->inputs->data[0]);
+      TfLiteTensor* filter = micro_context->AllocateTempTfLiteTensor(node->inputs->data[1]);
+      TfLiteTensor* output = micro_context->AllocateTempTfLiteTensor(node->outputs->data[0]);
+
+      // check nullptr
+      if (input == nullptr) {
+          printf("Error: input tensor is null\r\n");
+          // add something to avoid node from optimization removal
+          int size = node->inputs->size;
+          printf("Num inputs: %d\n", size);
+          return kTfLiteError;
+      }
 
       const auto* params = reinterpret_cast<const TfLiteConvParams*>(node->builtin_data);
 
@@ -83,12 +124,22 @@ namespace tflite {
       // Conv2D filter shape: [output_channels, filter_height, filter_width, input_channels]
       int num_channels = filter->dims->data[0];
 
-      data->per_channel_output_multiplier = static_cast<int32_t *>(
-          context->AllocatePersistentBuffer(context, num_channels * sizeof(int32_t))
-      );
-      data->per_channel_output_shift = static_cast<int *>(
-          context->AllocatePersistentBuffer(context, num_channels * sizeof(int))
-      );
+      // only allocate if nullptr
+      if (data->per_channel_output_multiplier == nullptr) {
+        data->per_channel_output_multiplier = 
+            static_cast<int32_t *>(context->AllocatePersistentBuffer(
+                context, num_channels * sizeof(int32_t)));
+      }
+
+      if (data->per_channel_output_shift == nullptr) {
+        data->per_channel_output_shift = 
+            static_cast<int *>(context->AllocatePersistentBuffer(
+                context, num_channels * sizeof(int)));
+      }
+
+      // check allocations
+      TF_LITE_ENSURE(context, data->per_channel_output_multiplier != nullptr);
+      TF_LITE_ENSURE(context, data->per_channel_output_shift != nullptr);
 
       const auto* affine_quantization = 
           reinterpret_cast<TfLiteAffineQuantization *>(filter->quantization.params);
@@ -108,6 +159,11 @@ namespace tflite {
                            &data->per_channel_output_shift[i]);
       }
 
+      // free temp tensors
+      micro_context->DeallocateTempTfLiteTensor(output);
+      micro_context->DeallocateTempTfLiteTensor(filter);
+      micro_context->DeallocateTempTfLiteTensor(input);
+
       return kTfLiteOk;
     }
 
@@ -118,7 +174,10 @@ namespace tflite {
 
       const TfLiteEvalTensor* input = tflite::micro::GetEvalInput(context, node, 0);
       const TfLiteEvalTensor* filter = tflite::micro::GetEvalInput(context, node, 1);
-      const TfLiteEvalTensor* bias = tflite::micro::GetEvalInput(context, node, 2);
+
+      // bias is optional
+      const TfLiteEvalTensor* bias = (node->inputs->size == 3) ? tflite::micro::GetEvalInput(context, node, 2) : nullptr;
+      
       TfLiteEvalTensor* output = tflite::micro::GetEvalOutput(context, node, 0);
 
       // get data pointers
