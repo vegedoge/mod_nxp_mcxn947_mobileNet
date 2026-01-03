@@ -212,6 +212,19 @@ namespace tflite {
 
               // init accumulator
               int32_t acc = (bias_data) ? bias_data[out_channels] : 0;
+              
+              // try to avoid bias
+              // acc = 0;
+              acc = acc >> 4; // try to reduce bias effect
+
+              // DEBUG PRINT
+              bool debug_print = (b==0 && out_y==0 && out_x==0 && out_channels==0);
+              if (debug_print)
+              {
+                printf("DEBUG: Initial Acc(bias) = %ld\r\n", acc);
+                printf("DEBUG: Input Offset = %ld\r\n", data->input_offset);
+              }
+              
 
               const int in_y_origin = (out_y * stride_height) - pad_height;
               const int in_x_origin = (out_x * stride_width) - pad_width;
@@ -243,10 +256,28 @@ namespace tflite {
                       const int8_t filter_val = 
                           GET_INT4_WEIGHT(filter_data, filter_index);
 
+                      // --- DEBUG LOOP ---
+                      // Only print first 10 macs
+                      static int print_count = 0;
+                      if (debug_print && print_count < 10) {
+                          printf("  [%d] In=%d, Off=%ld, W_int4=%d, MAC+=%ld\r\n", 
+                                print_count, 
+                                input_val, 
+                                data->input_offset, 
+                                filter_val, 
+                                (int32_t)(input_val + data->input_offset) * filter_val);
+                          print_count++;
+                      }
+
                       acc += (static_cast<int32_t>(input_val + data->input_offset) *
                               static_cast<int32_t>(filter_val));
                     }
                   }
+                }
+
+                if (debug_print)
+                {
+                  printf("DEBUG: Before quantization Acc = %ld\r\n", acc);
                 }
               }
 

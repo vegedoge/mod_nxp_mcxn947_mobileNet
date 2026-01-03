@@ -106,6 +106,12 @@ status_t MODEL_Init(void)
 
 status_t MODEL_RunInference(void)
 {
+    // test for all 0s
+    // TfLiteTensor* input_tensor = s_interpreter->input(0);
+    // int8_t* input_data = tflite::GetTensorData<int8_t>(input_tensor);
+
+    // size_t input_bytes = input_tensor->bytes;
+    // memset(input_data, 0, input_bytes);
 
     if (s_interpreter->Invoke() != kTfLiteOk)
     {

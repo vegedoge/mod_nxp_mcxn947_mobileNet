@@ -215,6 +215,10 @@ namespace tflite {
               // accumulator init
               int32_t acc = (bias_data) ? bias_data[ch] : 0;
 
+              // dismiss bias
+              // acc = 0;
+              acc = acc >> 4; // try to reduce bias effect
+
               const int in_y_origin = (out_y * stride_height) - pad_height;
               const int in_x_origin = (out_x * stride_width) - pad_width;
 

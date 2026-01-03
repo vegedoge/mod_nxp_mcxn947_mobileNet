@@ -42,6 +42,27 @@ status_t MODEL_ProcessOutput(const uint8_t* data, const tensor_dims_t* dims,
     PRINTF("     Detected: %s (%d%%)" EOL, label, score);
     PRINTF("----------------------------------------" EOL);
 
+    // Raw output to compare
+    const int8_t* raw_logits = reinterpret_cast<const int8_t*>(data);
+    int num_classes = dims->data[dims->size - 1];
+
+    PRINTF("Raw model output logits:" EOL);
+    for (int i = 0; i < num_classes; i++)
+    {
+        int val = static_cast<int>(raw_logits[i]);
+        
+        // fix negative values
+        if (val < 0)
+        {
+            PRINTF("Class %2d: -%d" EOL, i, -val);
+        }
+        else
+        {
+            PRINTF("Class %2d:  %d" EOL, i, val);
+        }
+    }
+    PRINTF("----------------------------------------" EOL);
+
 #ifdef EIQ_GUI_PRINTF
     GUI_PrintfToBuffer(GUI_X_POS, GUI_Y_POS, "Detected: %.20s (%d%%)", label, score);
 #endif
