@@ -57,7 +57,7 @@ int main(void)
             for (;;) {}
         }
 
-        MODEL_ConvertInput(inputData, &inputDims, inputType);
+        // MODEL_ConvertInput(inputData, &inputDims, inputType);
 
         auto startTime = TIMER_GetTimeInUS();
         MODEL_RunInference();

@@ -24,7 +24,13 @@ limitations under the License.
 
 #include "fsl_debug_console.h"
 #include "model.h"
+
+// difference of quantized-model
 #include "model_data.h"
+// #include "model_data_int8.h"
+
+// post-processed input
+#include "image_data_direct.h"
 
 // modules for profiling
 // the original tflm profiler can not stick to the NXP timer functions
@@ -106,12 +112,24 @@ status_t MODEL_Init(void)
 
 status_t MODEL_RunInference(void)
 {
-    // test for all 0s
-    // TfLiteTensor* input_tensor = s_interpreter->input(0);
-    // int8_t* input_data = tflite::GetTensorData<int8_t>(input_tensor);
+    // test for all 1s
+    TfLiteTensor* input_tensor = s_interpreter->input(0);
+    int8_t* input_data = tflite::GetTensorData<int8_t>(input_tensor);
 
     // size_t input_bytes = input_tensor->bytes;
-    // memset(input_data, 0, input_bytes);
+    // memset(input_data, 1, input_bytes);
+
+    // PRINTF("DEBUG CHECK: Input[0-4]: %d, %d, %d, %d, %d\r\n", 
+    //        input_data[0], input_data[1], input_data[2], input_data[3], input_data[4]);
+
+    memcpy(input_data, image_data_direct, input_tensor->bytes);
+
+    // To compare input with pythono
+    PRINTF("MCU INPUT TENSOR (First 16 bytes):\r\n");
+    for(int i=0; i<16; i++) {
+        PRINTF("%d, ", (int)input_data[i]);
+    }
+    PRINTF("\r\n");
 
     if (s_interpreter->Invoke() != kTfLiteOk)
     {
@@ -179,7 +197,7 @@ void MODEL_ConvertInput(uint8_t* data, tensor_dims_t* dims, tensor_type_t type)
             for (int i = size - 1; i >= 0; i--)
             {
                 reinterpret_cast<int8_t*>(data)[i] =
-                    static_cast<int>(data[i]) - 127;
+                    static_cast<int>(data[i]) - 128;
             }
             break;
         case kTensorType_FLOAT32:
