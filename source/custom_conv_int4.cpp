@@ -110,7 +110,23 @@ namespace tflite {
       );
 
       // offset quantization
-      data->input_offset = -input->params.zero_point;
+
+      // debug print
+      // 1. read params from metadata
+      data->input_offset = -input->params.zero_point; 
+
+      // 2. check this value, is it too large?
+      printf("DEBUG CHECK: Model ZeroPoint is %d, Calculated Offset is %ld\r\n", 
+            input->params.zero_point, data->input_offset);
+
+      // if (input->dims->data[3] == 3) {
+      //   printf("DEBUG: Detected First Layer (RGB). Forcing Input Offset to 1.\r\n");
+      //   data->input_offset = 1;
+      // }
+
+      // set to 1
+      // data->input_offset = 1;
+
       data->output_offset = output->params.zero_point;
 
       // Actication range
@@ -153,7 +169,7 @@ namespace tflite {
 
       for (int i = 0; i < num_channels; ++i) {
         const double filter_scale = static_cast<double>(filter_scales[i]);
-        const double effective_scale = (input_scale * filter_scale) / output_scale;
+        const double effective_scale = (input_scale * filter_scale * 16.0) / output_scale;
         QuantizeMultiplier(effective_scale,
                            &data->per_channel_output_multiplier[i],
                            &data->per_channel_output_shift[i]);
@@ -215,7 +231,7 @@ namespace tflite {
               
               // try to avoid bias
               // acc = 0;
-              acc = acc >> 4; // try to reduce bias effect
+              // acc = acc >> 4; // try to reduce bias effect
 
               // DEBUG PRINT
               bool debug_print = (b==0 && out_y==0 && out_x==0 && out_channels==0);
@@ -277,7 +293,23 @@ namespace tflite {
 
                 if (debug_print)
                 {
-                  printf("DEBUG: Before quantization Acc = %ld\r\n", acc);
+                  // printf("DEBUG: Before quantization Acc = %ld\r\n", acc);
+                  // 【新增调试打印】只打印第一个 Batch, 第一个像素, 第一个通道
+                  if (b == 0 && out_y == 0 && out_x == 0 && out_channels == 0) {
+                    // 1. 打印累加器的值 (还没缩放前)
+                    // 预期：Python算出来大概是正数 (因为 -69 - (-128) = 59)
+                    // 如果这里是负数或者0，那就是 MAC 算错了
+                    printf("DEBUG CHECK:\r\n");
+                    printf("  Acc (Before Quant) = %ld\r\n", acc);
+                    
+                    // 2. 打印量化参数
+                    // 如果 Multiplier 是 0，那就是 Scale 没算对
+                    printf("  Multiplier = %ld\r\n", data->per_channel_output_multiplier[out_channels]);
+                    printf("  Shift      = %d\r\n", data->per_channel_output_shift[out_channels]);
+                    
+                    // 3. 打印 Output Offset (应该约等于 -128)
+                    printf("  Output Offset = %ld\r\n", data->output_offset);
+                  }
                 }
               }
 
@@ -288,9 +320,17 @@ namespace tflite {
                   data->per_channel_output_shift[out_channels]
               );
               acc += data->output_offset;
+
+              if (b == 0 && out_y == 0 && out_x == 0 && out_channels == 0) {
+                  printf("  Final Result before clamping= %ld\r\n", acc);
+              }
               // clamp
               acc = std::max(acc, data->output_activation_min);
               acc = std::min(acc, data->output_activation_max);
+
+              if (b == 0 && out_y == 0 && out_x == 0 && out_channels == 0) {
+                  printf("  Final Result = %ld\r\n", acc);
+              }
 
               // store output
               int output_index = 
@@ -302,6 +342,20 @@ namespace tflite {
             }
           }
         }
+      }
+
+      // compare the output with python, only first layer
+      if (input_depth == 3) {
+        printf("\r\n[MCU DEBUG] Layer 1 (Conv2D) Output First 16 bytes:\r\n");
+        for (int i = 0; i < 16; i++) {
+            // force to int
+            printf("%d, ", (int)output_data[i]);
+        }
+        printf("\r\n");
+        
+        // 打印完直接死循环卡住，方便我们看日志，防止被后面刷屏
+        // 确认第一层对了，再把这行删掉
+        while(1) {}; 
       }
 
       return kTfLiteOk;

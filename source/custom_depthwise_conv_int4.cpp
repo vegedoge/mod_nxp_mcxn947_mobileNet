@@ -106,7 +106,17 @@ namespace tflite {
       );
 
       // Quantization params
-      data->input_offset = -input->params.zero_point;
+
+      // debug print
+      // 1. read params from metadata
+      data->input_offset = -input->params.zero_point; 
+
+      // 2. check this value, is it too large?
+      printf("DEBUG CHECK: Model ZeroPoint is %d, Calculated Offset is %ld\r\n", 
+            input->params.zero_point, data->input_offset);
+
+      // set to 1, only used for the input from outside
+      // data->input_offset = 1;
       data->output_offset = output->params.zero_point;
 
       // clamp
@@ -157,7 +167,7 @@ namespace tflite {
 
       for (int i = 0; i < num_channels; ++i) {
         const double filter_scale = static_cast<double>(filter_scales[i]);
-        const double effective_scale = (input_scale * filter_scale) / output_scale;
+        const double effective_scale = (input_scale * filter_scale * 16.0) / output_scale;
         QuantizeMultiplier(effective_scale,
                            &data->per_channel_output_multiplier[i],
                            &data->per_channel_output_shift[i]);
@@ -217,7 +227,7 @@ namespace tflite {
 
               // dismiss bias
               // acc = 0;
-              acc = acc >> 4; // try to reduce bias effect
+              // acc = acc >> 4; // try to reduce bias effect
 
               const int in_y_origin = (out_y * stride_height) - pad_height;
               const int in_x_origin = (out_x * stride_width) - pad_width;
