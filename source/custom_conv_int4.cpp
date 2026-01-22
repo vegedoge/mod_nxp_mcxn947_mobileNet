@@ -21,6 +21,8 @@
 #include "tensorflow/lite/c/builtin_op_data.h"
 #include "tensorflow/lite/c/common.h"
 
+#include <stdarg.h>
+#include <stdio.h>
 
 namespace tflite {
   namespace {
@@ -45,6 +47,24 @@ namespace tflite {
       int32_t output_activation_min;
       int32_t output_activation_max;
     };
+
+    static inline void DebugLogNDJSONPrintf(const char* run_id,
+                                            const char* hypothesis_id,
+                                            const char* location,
+                                            const char* message,
+                                            const char* data_fmt,
+                                            ...) {
+      char data_buf[256];
+      data_buf[0] = '\0';
+      va_list args;
+      va_start(args, data_fmt);
+      vsnprintf(data_buf, sizeof(data_buf), data_fmt, args);
+      va_end(args);
+      // NOTE: 打印到串口，由上位机脚本采集写入 debug.log
+      printf("{\"sessionId\":\"debug-session\",\"runId\":\"%s\",\"hypothesisId\":\"%s\","
+             "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":0}\r\n",
+             run_id, hypothesis_id, location, message, data_buf);
+    }
 
     void* ConvInit_INT4(TfLiteContext* context, const char* buffer, size_t length) {
       // return context->AllocatePersistentBuffer(context, sizeof(ConvOpData));
@@ -136,6 +156,27 @@ namespace tflite {
           &data->output_activation_max
       );
 
+      // #region agent log
+      DebugLogNDJSONPrintf(
+          "pre-fix",
+          "H1",
+          "custom_conv_int4.cpp:input_offset",
+          "conv_prepare_input_output_params",
+          "{\"input_zero_point\":%d,\"input_offset\":%ld,"
+          "\"input_scale\":%.9f,\"output_scale\":%.9f,"
+          "\"output_zero_point\":%d,\"out_act_min\":%ld,\"out_act_max\":%ld,"
+          "\"input_type\":%d,\"output_type\":%d}",
+          input->params.zero_point,
+          data->input_offset,
+          static_cast<double>(input->params.scale),
+          static_cast<double>(output->params.scale),
+          output->params.zero_point,
+          data->output_activation_min,
+          data->output_activation_max,
+          static_cast<int>(input->type),
+          static_cast<int>(output->type));
+      // #endregion
+
       // Per-channel quantization parameters
       // Conv2D filter shape: [output_channels, filter_height, filter_width, input_channels]
       int num_channels = filter->dims->data[0];
@@ -173,6 +214,21 @@ namespace tflite {
         QuantizeMultiplier(effective_scale,
                            &data->per_channel_output_multiplier[i],
                            &data->per_channel_output_shift[i]);
+        if (i == 0) {
+          // #region agent log
+      DebugLogNDJSONPrintf(
+              "pre-fix",
+              "H3",
+              "custom_conv_int4.cpp:per_channel_quant",
+              "conv_prepare_scale_channel0",
+              "{\"filter_scale\":%.9f,\"effective_scale\":%.9f,"
+              "\"multiplier\":%ld,\"shift\":%d}",
+              filter_scale,
+              effective_scale,
+              static_cast<long>(data->per_channel_output_multiplier[i]),
+              data->per_channel_output_shift[i]);
+          // #endregion
+        }
       }
 
       // free temp tensors
@@ -276,6 +332,27 @@ namespace tflite {
                       const int8_t filter_val = 
                           GET_INT4_WEIGHT(filter_data, filter_index);
 
+                      if (debug_print && print_count == 0) {
+                        const uint8_t packed_byte =
+                            ((const uint8_t*)(filter_data))[filter_index / 2];
+                        // #region agent log
+                        DebugLogNDJSONPrintf(
+                            "pre-fix",
+                            "H2",
+                            "custom_conv_int4.cpp:first_mac",
+                            "conv_eval_first_mac",
+                            "{\"input_val\":%d,\"input_offset\":%ld,"
+                            "\"filter_index\":%d,\"packed_byte\":%u,"
+                            "\"filter_val\":%d,\"bias\":%ld}",
+                            static_cast<int>(input_val),
+                            data->input_offset,
+                            filter_index,
+                            static_cast<unsigned int>(packed_byte),
+                            static_cast<int>(filter_val),
+                            static_cast<long>(acc));
+                        // #endregion
+                      }
+
                       // --- DEBUG LOOP ---
                       // Only print first 10 macs
                       static int print_count = 0;
@@ -325,6 +402,21 @@ namespace tflite {
               );
               acc += data->output_offset;
 
+              if (b == 0 && out_y == 0 && out_x == 0 && out_channels == 0) {
+                // #region agent log
+                DebugLogNDJSONPrintf(
+                    "pre-fix",
+                    "H4",
+                    "custom_conv_int4.cpp:requant",
+                    "conv_eval_requant_channel0",
+                    "{\"acc_post_mult\":%ld,\"output_offset\":%ld,"
+                    "\"out_act_min\":%ld,\"out_act_max\":%ld}",
+                    static_cast<long>(acc),
+                    data->output_offset,
+                    data->output_activation_min,
+                    data->output_activation_max);
+                // #endregion
+              }
               if (b == 0 && out_y == 0 && out_x == 0 && out_channels == 0) {
                   printf("  Final Result before clamping= %ld\r\n", acc);
               }
