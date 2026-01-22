@@ -277,6 +277,8 @@ namespace tflite {
       const int pad_height = data->padding.height;
       const int pad_width = data->padding.width;
 
+      static int conv_debug_once = 0;
+
       // core loop
       for (int b = 0; b < batches; ++b) {
         for (int out_y = 0; out_y < output_height; ++out_y) {
@@ -301,6 +303,41 @@ namespace tflite {
                 printf("DEBUG: Input Offset = %ld\r\n", data->input_offset);
               }
               
+              if (debug_print && conv_debug_once == 0) {
+                // #region agent log
+                DebugLogNDJSONPrintf(
+                    "pre-fix",
+                    "H5",
+                    "custom_conv_int4.cpp:bias_shift",
+                    "conv_eval_bias_shift",
+                    "{\"bias_raw\":%ld,\"bias_shifted\":%ld}",
+                    static_cast<long>(bias_data ? bias_data[out_channels] : 0),
+                    static_cast<long>(acc));
+                // #endregion
+
+                // #region agent log
+                DebugLogNDJSONPrintf(
+                    "pre-fix",
+                    "H2",
+                    "custom_conv_int4.cpp:pack_probe",
+                    "conv_eval_first8_weights",
+                    "{\"w0\":%d,\"w1\":%d,\"w2\":%d,\"w3\":%d,\"w4\":%d,\"w5\":%d,\"w6\":%d,\"w7\":%d,"
+                    "\"pb0\":%u,\"pb1\":%u,\"pb2\":%u,\"pb3\":%u}",
+                    static_cast<int>(GET_INT4_WEIGHT(filter_data, 0)),
+                    static_cast<int>(GET_INT4_WEIGHT(filter_data, 1)),
+                    static_cast<int>(GET_INT4_WEIGHT(filter_data, 2)),
+                    static_cast<int>(GET_INT4_WEIGHT(filter_data, 3)),
+                    static_cast<int>(GET_INT4_WEIGHT(filter_data, 4)),
+                    static_cast<int>(GET_INT4_WEIGHT(filter_data, 5)),
+                    static_cast<int>(GET_INT4_WEIGHT(filter_data, 6)),
+                    static_cast<int>(GET_INT4_WEIGHT(filter_data, 7)),
+                    static_cast<unsigned int>(((const uint8_t*)filter_data)[0]),
+                    static_cast<unsigned int>(((const uint8_t*)filter_data)[1]),
+                    static_cast<unsigned int>(((const uint8_t*)filter_data)[2]),
+                    static_cast<unsigned int>(((const uint8_t*)filter_data)[3]));
+                // #endregion
+              }
+
 
               const int in_y_origin = (out_y * stride_height) - pad_height;
               const int in_x_origin = (out_x * stride_width) - pad_width;
@@ -438,6 +475,10 @@ namespace tflite {
             }
           }
         }
+      }
+
+      if (input_depth == 3 && conv_debug_once == 0) {
+        conv_debug_once = 1;
       }
 
       // compare the output with python, only first layer
