@@ -272,6 +272,20 @@ namespace tflite {
               // accumulator init
               int32_t acc = (bias_data) ? bias_data[ch] : 0;
 
+              const bool dw_debug = (b == 0 && out_y == 0 && out_x == 0 && ch == 0);
+              if (dw_debug && dw_debug_once == 0) {
+                // #region agent log
+                DebugLogNDJSONPrintf(
+                    "pre-fix",
+                    "H10",
+                    "custom_depthwise_conv_int4.cpp:bias_shift",
+                    "dw_eval_bias_shift",
+                    "{\"bias_raw\":%ld,\"bias_shifted\":%ld}",
+                    static_cast<long>(bias_data ? bias_data[ch] : 0),
+                    static_cast<long>(bias_data ? (bias_data[ch] >> 4) : 0));
+                // #endregion
+              }
+
               // dismiss bias
               // acc = 0;
               // acc = acc >> 4; // try to reduce bias effect
@@ -336,7 +350,7 @@ namespace tflite {
 
               acc += data->output_offset;
 
-              if (b == 0 && out_y == 0 && out_x == 0 && ch == 0 && dw_debug_once == 0) {
+              if (dw_debug && dw_debug_once == 0) {
                 // #region agent log
                 DebugLogNDJSONPrintf(
                     "pre-fix",
@@ -354,6 +368,18 @@ namespace tflite {
               // clamp
               acc = std::max(acc, data->output_activation_min);
               acc = std::min(acc, data->output_activation_max);
+
+              if (dw_debug && dw_debug_once == 0) {
+                // #region agent log
+                DebugLogNDJSONPrintf(
+                    "pre-fix",
+                    "H11",
+                    "custom_depthwise_conv_int4.cpp:clamp",
+                    "dw_eval_clamp_channel0",
+                    "{\"acc_clamped\":%ld}",
+                    static_cast<long>(acc));
+                // #endregion
+              }
 
               // store output
               int output_idx = ((b * output_height + out_y) * output_width + out_x) * output_depth + ch;
