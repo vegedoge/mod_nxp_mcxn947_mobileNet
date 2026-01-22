@@ -271,6 +271,7 @@ namespace tflite {
             for (int ch = 0; ch < output_depth; ++ch) {
               // accumulator init
               int32_t acc = (bias_data) ? bias_data[ch] : 0;
+              acc = acc >> 4; // keep bias scale consistent with packed int4 weights
 
               const bool dw_debug = (b == 0 && out_y == 0 && out_x == 0 && ch == 0);
               if (dw_debug && dw_debug_once == 0) {
@@ -288,7 +289,6 @@ namespace tflite {
 
               // dismiss bias
               // acc = 0;
-              // acc = acc >> 4; // try to reduce bias effect
 
               const int in_y_origin = (out_y * stride_height) - pad_height;
               const int in_x_origin = (out_x * stride_width) - pad_width;
