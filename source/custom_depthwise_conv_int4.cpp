@@ -23,9 +23,35 @@
 #include "tensorflow/lite/c/common.h"
 
 #include <cmath>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
 
 namespace tflite {
   namespace {
+    static inline void DebugLogNDJSONPrintf(const char* run_id,
+                                            const char* hypothesis_id,
+                                            const char* location,
+                                            const char* message,
+                                            const char* data_fmt,
+                                            ...) {
+      char data_buf[256];
+      data_buf[0] = '\0';
+      va_list args;
+      va_start(args, data_fmt);
+      vsnprintf(data_buf, sizeof(data_buf), data_fmt, args);
+      va_end(args);
+      // NOTE: 打印到串口，由上位机脚本采集写入 debug.log
+      printf("{\"sessionId\":\"debug-session\",\"runId\":\"%s\",\"hypothesisId\":\"%s\","
+             "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":0}\r\n",
+             run_id, hypothesis_id, location, message, data_buf);
+    }
+
+    static inline uint32_t FloatBits(float v) {
+      uint32_t out = 0;
+      memcpy(&out, &v, sizeof(out));
+      return out;
+    }
 
     #define MAX_DEPTHWISE_CHANNELS 512 // alpha = 0.25
 
@@ -126,6 +152,25 @@ namespace tflite {
           &data->output_activation_max
       );
 
+      if (bias != nullptr) {
+        // #region agent log
+        DebugLogNDJSONPrintf(
+            "pre-fix",
+            "H7",
+            "custom_depthwise_conv_int4.cpp:prepare_params",
+            "dw_prepare_params",
+            "{\"input_scale_bits\":%u,\"input_zero_point\":%d,"
+            "\"output_scale_bits\":%u,\"output_zero_point\":%d,"
+            "\"bias_scale_bits\":%u,\"bias_zero_point\":%d}",
+            static_cast<unsigned int>(FloatBits(input->params.scale)),
+            static_cast<int>(input->params.zero_point),
+            static_cast<unsigned int>(FloatBits(output->params.scale)),
+            static_cast<int>(output->params.zero_point),
+            static_cast<unsigned int>(FloatBits(bias->params.scale)),
+            static_cast<int>(bias->params.zero_point));
+        // #endregion
+      }
+
       // per-channel quantization
       int num_channels = filter->dims->data[3];
 
@@ -217,6 +262,8 @@ namespace tflite {
       const int pad_height = data->padding.height;
       const int pad_width = data->padding.width;
 
+      static int dw_debug_once = 0;
+
       // --- Depthwise Conv ---
       for (int b = 0; b < batches; ++b) {
         for (int out_y = 0; out_y < output_height; ++out_y) {
@@ -250,6 +297,28 @@ namespace tflite {
                     int filter_flat_index = fy * filter_width * output_depth + fx * output_depth + ch;
 
                     int32_t filter_val = GET_INT4_WEIGHT(packed_filter_data, filter_flat_index);
+
+                    if (b == 0 && out_y == 0 && out_x == 0 && ch == 0 && dw_debug_once == 0) {
+                      // #region agent log
+                      DebugLogNDJSONPrintf(
+                          "pre-fix",
+                          "H8",
+                          "custom_depthwise_conv_int4.cpp:pack_probe",
+                          "dw_eval_first8_weights",
+                          "{\"w0\":%d,\"w1\":%d,\"w2\":%d,\"w3\":%d,\"w4\":%d,\"w5\":%d,"
+                          "\"w6\":%d,\"w7\":%d,\"pb0\":%u,\"pb1\":%u}",
+                          static_cast<int>(GET_INT4_WEIGHT(packed_filter_data, 0)),
+                          static_cast<int>(GET_INT4_WEIGHT(packed_filter_data, 1)),
+                          static_cast<int>(GET_INT4_WEIGHT(packed_filter_data, 2)),
+                          static_cast<int>(GET_INT4_WEIGHT(packed_filter_data, 3)),
+                          static_cast<int>(GET_INT4_WEIGHT(packed_filter_data, 4)),
+                          static_cast<int>(GET_INT4_WEIGHT(packed_filter_data, 5)),
+                          static_cast<int>(GET_INT4_WEIGHT(packed_filter_data, 6)),
+                          static_cast<int>(GET_INT4_WEIGHT(packed_filter_data, 7)),
+                          static_cast<unsigned int>(((const uint8_t*)packed_filter_data)[0]),
+                          static_cast<unsigned int>(((const uint8_t*)packed_filter_data)[1]));
+                      // #endregion
+                    }
                     
                     // MAC
                     acc += (input_val + data->input_offset) * filter_val;
@@ -267,6 +336,21 @@ namespace tflite {
 
               acc += data->output_offset;
 
+              if (b == 0 && out_y == 0 && out_x == 0 && ch == 0 && dw_debug_once == 0) {
+                // #region agent log
+                DebugLogNDJSONPrintf(
+                    "pre-fix",
+                    "H9",
+                    "custom_depthwise_conv_int4.cpp:requant",
+                    "dw_eval_requant_channel0",
+                    "{\"acc_post_mult\":%ld,\"output_offset\":%ld,"
+                    "\"out_act_min\":%ld,\"out_act_max\":%ld}",
+                    static_cast<long>(acc),
+                    data->output_offset,
+                    data->output_activation_min,
+                    data->output_activation_max);
+                // #endregion
+              }
               // clamp
               acc = std::max(acc, data->output_activation_min);
               acc = std::min(acc, data->output_activation_max);
@@ -277,6 +361,10 @@ namespace tflite {
             }
           }
         }
+      }
+
+      if (batches == 1 && output_depth > 0 && dw_debug_once == 0) {
+        dw_debug_once = 1;
       }
       
       return kTfLiteOk;
