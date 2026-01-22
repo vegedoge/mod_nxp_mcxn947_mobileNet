@@ -30,7 +30,9 @@ limitations under the License.
 // #include "model_data_int8.h"
 
 // post-processed input
+// #include "image_data.h"
 #include "image_data_direct.h"
+
 
 // modules for profiling
 // the original tflm profiler can not stick to the NXP timer functions
@@ -123,6 +125,7 @@ status_t MODEL_RunInference(void)
     //        input_data[0], input_data[1], input_data[2], input_data[3], input_data[4]);
 
     memcpy(input_data, image_data_direct, input_tensor->bytes);
+    // memcpy(input_data, image_data, input_tensor->bytes);
 
     // To compare input with pythono
     PRINTF("MCU INPUT TENSOR (First 16 bytes):\r\n");

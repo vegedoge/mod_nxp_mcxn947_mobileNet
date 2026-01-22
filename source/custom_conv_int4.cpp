@@ -213,7 +213,8 @@ namespace tflite {
 
       const int output_height = output->dims->data[1];
       const int output_width = output->dims->data[2];
-      const int output_depth = output->dims->data[0]; // Conv2D output is dim[0]
+      const int output_depth = output->dims->data[3]; // Conv2D output is dim[0]
+      printf("DEBUG: output_depth is: %d", output_depth);
 
       const int stride_height = params->stride_height;
       const int stride_width = params->stride_width;
@@ -231,12 +232,15 @@ namespace tflite {
               
               // try to avoid bias
               // acc = 0;
-              // acc = acc >> 4; // try to reduce bias effect
+              acc = acc >> 4; // try to reduce bias effect
 
               // DEBUG PRINT
               bool debug_print = (b==0 && out_y==0 && out_x==0 && out_channels==0);
               if (debug_print)
               {
+                // if (out_channels == 0) {
+                //   acc = acc << 3;
+                // }
                 printf("DEBUG: Initial Acc(bias) = %ld\r\n", acc);
                 printf("DEBUG: Input Offset = %ld\r\n", data->input_offset);
               }
@@ -275,7 +279,7 @@ namespace tflite {
                       // --- DEBUG LOOP ---
                       // Only print first 10 macs
                       static int print_count = 0;
-                      if (debug_print && print_count < 10) {
+                      if (debug_print && print_count < 27) {
                           printf("  [%d] In=%d, Off=%ld, W_int4=%d, MAC+=%ld\r\n", 
                                 print_count, 
                                 input_val, 
@@ -355,7 +359,7 @@ namespace tflite {
         
         // 打印完直接死循环卡住，方便我们看日志，防止被后面刷屏
         // 确认第一层对了，再把这行删掉
-        while(1) {}; 
+        // while(1) {}; 
       }
 
       return kTfLiteOk;
