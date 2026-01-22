@@ -23,6 +23,7 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 
 namespace tflite {
   namespace {
@@ -66,6 +67,12 @@ namespace tflite {
              run_id, hypothesis_id, location, message, data_buf);
     }
 
+    static inline uint32_t FloatBits(float v) {
+      uint32_t out = 0;
+      memcpy(&out, &v, sizeof(out));
+      return out;
+    }
+
     void* ConvInit_INT4(TfLiteContext* context, const char* buffer, size_t length) {
       // return context->AllocatePersistentBuffer(context, sizeof(ConvOpData));
       // void* raw = context->AllocatePersistentBuffer(context, sizeof(ConvOpData));
@@ -101,6 +108,9 @@ namespace tflite {
       // const TfLiteTensor *input = context->GetTensor(context, node->inputs->data[0]);
       TfLiteTensor* input = micro_context->AllocateTempTfLiteTensor(node->inputs->data[0]);
       TfLiteTensor* filter = micro_context->AllocateTempTfLiteTensor(node->inputs->data[1]);
+      TfLiteTensor* bias = (node->inputs->size == 3)
+                               ? micro_context->AllocateTempTfLiteTensor(node->inputs->data[2])
+                               : nullptr;
       TfLiteTensor* output = micro_context->AllocateTempTfLiteTensor(node->outputs->data[0]);
 
       // check nullptr
@@ -163,19 +173,33 @@ namespace tflite {
           "custom_conv_int4.cpp:input_offset",
           "conv_prepare_input_output_params",
           "{\"input_zero_point\":%d,\"input_offset\":%ld,"
-          "\"input_scale\":%.9f,\"output_scale\":%.9f,"
+          "\"input_scale_bits\":%u,\"output_scale_bits\":%u,"
           "\"output_zero_point\":%d,\"out_act_min\":%ld,\"out_act_max\":%ld,"
           "\"input_type\":%d,\"output_type\":%d}",
           input->params.zero_point,
           data->input_offset,
-          static_cast<double>(input->params.scale),
-          static_cast<double>(output->params.scale),
+          static_cast<unsigned int>(FloatBits(input->params.scale)),
+          static_cast<unsigned int>(FloatBits(output->params.scale)),
           output->params.zero_point,
           data->output_activation_min,
           data->output_activation_max,
           static_cast<int>(input->type),
           static_cast<int>(output->type));
       // #endregion
+
+      if (bias != nullptr) {
+        // #region agent log
+        DebugLogNDJSONPrintf(
+            "pre-fix",
+            "H6",
+            "custom_conv_int4.cpp:bias_params",
+            "conv_prepare_bias_params",
+            "{\"bias_type\":%d,\"bias_scale_bits\":%u,\"bias_zero_point\":%d}",
+            static_cast<int>(bias->type),
+            static_cast<unsigned int>(FloatBits(bias->params.scale)),
+            static_cast<int>(bias->params.zero_point));
+        // #endregion
+      }
 
       // Per-channel quantization parameters
       // Conv2D filter shape: [output_channels, filter_height, filter_width, input_channels]
@@ -215,16 +239,17 @@ namespace tflite {
                            &data->per_channel_output_multiplier[i],
                            &data->per_channel_output_shift[i]);
         if (i == 0) {
+          const float eff_scale_f = static_cast<float>(effective_scale);
           // #region agent log
       DebugLogNDJSONPrintf(
               "pre-fix",
               "H3",
               "custom_conv_int4.cpp:per_channel_quant",
               "conv_prepare_scale_channel0",
-              "{\"filter_scale\":%.9f,\"effective_scale\":%.9f,"
+              "{\"filter_scale_bits\":%u,\"effective_scale_bits\":%u,"
               "\"multiplier\":%ld,\"shift\":%d}",
-              filter_scale,
-              effective_scale,
+              static_cast<unsigned int>(FloatBits(filter_scales[i])),
+              static_cast<unsigned int>(FloatBits(eff_scale_f)),
               static_cast<long>(data->per_channel_output_multiplier[i]),
               data->per_channel_output_shift[i]);
           // #endregion
@@ -233,6 +258,7 @@ namespace tflite {
 
       // free temp tensors
       micro_context->DeallocateTempTfLiteTensor(output);
+      if (bias) micro_context->DeallocateTempTfLiteTensor(bias);
       micro_context->DeallocateTempTfLiteTensor(filter);
       micro_context->DeallocateTempTfLiteTensor(input);
 
@@ -241,6 +267,10 @@ namespace tflite {
 
     // Eval
     TfLiteStatus ConvEval_INT4(TfLiteContext* context, TfLiteNode* node) {
+      // debug
+      static int print_count = 0;
+      // debug end 
+
       const ConvOpData *data = static_cast<const ConvOpData *>(node->user_data);
       const auto *params = reinterpret_cast<const TfLiteConvParams *>(node->builtin_data);
 
@@ -392,7 +422,7 @@ namespace tflite {
 
                       // --- DEBUG LOOP ---
                       // Only print first 10 macs
-                      static int print_count = 0;
+                      
                       if (debug_print && print_count < 27) {
                           printf("  [%d] In=%d, Off=%ld, W_int4=%d, MAC+=%ld\r\n", 
                                 print_count, 
