@@ -531,6 +531,16 @@ namespace tflite {
         }
       }
 
+      if (input_depth == 8 && output_depth == 16) {
+#if DEBUG_PRINTS
+        printf("\r\n[MCU DEBUG] Layer 3 (Conv2D) Output First 16 bytes:\r\n");
+        for (int i = 0; i < 16; i++) {
+            printf("%d, ", (int)output_data[i]);
+        }
+        printf("\r\n");
+#endif
+      }
+
       if (input_depth == 3 && conv_debug_once == 0) {
         conv_debug_once = 1;
       }

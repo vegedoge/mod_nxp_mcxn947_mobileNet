@@ -401,6 +401,16 @@ namespace tflite {
         }
       }
 
+      if (dw_debug_once == 0 && input_depth == 8 && output_depth == 8) {
+#if DEBUG_PRINTS
+        printf("\r\n[MCU DEBUG] Layer 2 (DepthwiseConv2D) Output First 16 bytes:\r\n");
+        for (int i = 0; i < 16; ++i) {
+          printf("%d, ", static_cast<int>(output_data[i]));
+        }
+        printf("\r\n");
+#endif
+      }
+
       if (batches == 1 && output_depth > 0 && dw_debug_once == 0) {
         dw_debug_once = 1;
       }
