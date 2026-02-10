@@ -24,14 +24,24 @@ limitations under the License.
 
 #include "fsl_debug_console.h"
 #include "model.h"
+#include "demo_config.h"
+#include "output_postproc.h"
+#include "timer.h"
 
-// difference of quantized-model
+// Model selection is controlled by demo_config.h
+#if USE_INT4_CUSTOM_PATH
 #include "model_data.h"
-// #include "model_data_int8.h"
+#else
+#include "model_data_int8.h"
+#endif
 
 // post-processed input
 // #include "image_data.h"
 #include "image_data_direct.h"
+
+#if ENABLE_BATCH_TEST
+#include "test_batch_data.h"
+#endif
 
 
 // modules for profiling
@@ -46,6 +56,9 @@ static const tflite::Model* s_model = nullptr;
 static tflite::MicroInterpreter* s_interpreter = nullptr;
 
 extern tflite::MicroOpResolver &MODEL_GetOpsResolver();
+
+// Forward declaration for helper defined later in this file.
+uint8_t* GetTensorData(TfLiteTensor* tensor, tensor_dims_t* dims, tensor_type_t* type);
 
 // An area of memory to use for input, output, and intermediate arrays.
 // (Can be adjusted based on the model needs.)
@@ -127,12 +140,14 @@ status_t MODEL_RunInference(void)
     memcpy(input_data, image_data_direct, input_tensor->bytes);
     // memcpy(input_data, image_data, input_tensor->bytes);
 
-    // To compare input with pythono
+#if DEBUG_PRINTS
+    // To compare input with python
     PRINTF("MCU INPUT TENSOR (First 16 bytes):\r\n");
-    for(int i=0; i<16; i++) {
+    for (int i = 0; i < 16; i++) {
         PRINTF("%d, ", (int)input_data[i]);
     }
     PRINTF("\r\n");
+#endif
 
     if (s_interpreter->Invoke() != kTfLiteOk)
     {
@@ -140,10 +155,86 @@ status_t MODEL_RunInference(void)
         return kStatus_Fail;
     }
 
+#if DEBUG_PRINTS
     PRINTF("--- Operator Profiling Results ---\r\n");
     s_custom_profiler.LogResults();
     PRINTF("--- Profiling Ends ---\r\n");
+#endif
 
+    return kStatus_Success;
+}
+
+status_t MODEL_RunBatchTest(void)
+{
+#if ENABLE_BATCH_TEST
+    TfLiteTensor* input_tensor = s_interpreter->input(0);
+    TfLiteTensor* output_tensor = s_interpreter->output(0);
+
+    if (input_tensor->type != kTfLiteInt8) {
+        PRINTF("BatchTest: input type is not INT8\r\n");
+        return kStatus_Fail;
+    }
+
+    const size_t input_bytes = input_tensor->bytes;
+
+    int8_t* input_data = tflite::GetTensorData<int8_t>(input_tensor);
+    int8_t* output_data = tflite::GetTensorData<int8_t>(output_tensor);
+
+    tensor_dims_t output_dims;
+    tensor_type_t output_type;
+    GetTensorData(output_tensor, &output_dims, &output_type);
+
+    const int total = TEST_BATCH_SIZE;
+    const int8_t* inputs = g_test_batch_inputs;
+
+#if DEBUG_PRINTS
+    PRINTF("BatchTest: running %d samples\r\n", total);
+#endif
+
+    for (int i = 0; i < total; ++i) {
+        const int8_t* src = inputs + (i * input_bytes);
+        memcpy(input_data, src, input_bytes);
+
+        auto start_time = TIMER_GetTimeInUS();
+        if (s_interpreter->Invoke() != kTfLiteOk) {
+            PRINTF("BatchTest: invoke failed on sample %d\r\n", i);
+            return kStatus_Fail;
+        }
+        auto end_time = TIMER_GetTimeInUS();
+        int inference_time = static_cast<int>(end_time - start_time);
+
+        if (BATCH_TEST_PRINT_EVERY > 0 && (i % BATCH_TEST_PRINT_EVERY) == 0) {
+#if DEBUG_PRINTS
+            PRINTF("BatchTest[%d]\r\n", i);
+#endif
+            MODEL_ProcessOutput(reinterpret_cast<const uint8_t*>(output_data),
+                                &output_dims, output_type, inference_time);
+        }
+
+    }
+
+    return kStatus_Success;
+#else
+    PRINTF("BatchTest: disabled (ENABLE_BATCH_TEST=0)\r\n");
+    return kStatus_Fail;
+#endif
+}
+
+status_t MODEL_GetOutputQuantParams(float* scale, int* zeroPoint)
+{
+    if (scale == nullptr || zeroPoint == nullptr || s_interpreter == nullptr)
+    {
+        return kStatus_Fail;
+    }
+
+    TfLiteTensor* outputTensor = s_interpreter->output(0);
+    if (outputTensor == nullptr)
+    {
+        return kStatus_Fail;
+    }
+
+    *scale = outputTensor->params.scale;
+    *zeroPoint = outputTensor->params.zero_point;
     return kStatus_Success;
 }
 

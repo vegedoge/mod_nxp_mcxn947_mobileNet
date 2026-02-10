@@ -22,6 +22,8 @@
 #include "tensorflow/lite/c/builtin_op_data.h"
 #include "tensorflow/lite/c/common.h"
 
+#include "demo_config.h"
+
 #include <cmath>
 #include <stdarg.h>
 #include <stdio.h>
@@ -35,6 +37,7 @@ namespace tflite {
                                             const char* message,
                                             const char* data_fmt,
                                             ...) {
+#if DEBUG_PRINTS
       char data_buf[256];
       data_buf[0] = '\0';
       va_list args;
@@ -45,6 +48,13 @@ namespace tflite {
       printf("{\"sessionId\":\"debug-session\",\"runId\":\"%s\",\"hypothesisId\":\"%s\","
              "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":0}\r\n",
              run_id, hypothesis_id, location, message, data_buf);
+#else
+      (void)run_id;
+      (void)hypothesis_id;
+      (void)location;
+      (void)message;
+      (void)data_fmt;
+#endif
     }
 
     static inline uint32_t FloatBits(float v) {
@@ -138,8 +148,10 @@ namespace tflite {
       data->input_offset = -input->params.zero_point; 
 
       // 2. check this value, is it too large?
+#if DEBUG_PRINTS
       printf("DEBUG CHECK: Model ZeroPoint is %d, Calculated Offset is %ld\r\n", 
             input->params.zero_point, data->input_offset);
+#endif
 
       // set to 1, only used for the input from outside
       // data->input_offset = 1;

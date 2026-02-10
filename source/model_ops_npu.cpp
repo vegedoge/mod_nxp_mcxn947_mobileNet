@@ -16,6 +16,7 @@
 #include "tensorflow/lite/micro/kernels/softmax.h"
 #include "tensorflow/lite/micro/kernels/reshape.h"
 #include "tensorflow/lite/micro/kernels/depthwise_conv.h"
+#include "demo_config.h"
 
 // Custom INT4 ops
 #include "custom_conv_int4.h"
@@ -26,9 +27,14 @@ tflite::MicroOpResolver &MODEL_GetOpsResolver()
 {
     static tflite::MicroMutableOpResolver<12> s_microOpResolver;
 
-    // use custom INT4 Conv2D and DepthwiseConv2D instead
+    // Match kernel path with selected model variant.
+#if USE_INT4_CUSTOM_PATH
     s_microOpResolver.AddConv2D(tflite::Register_CUSTOM_CONV_INT4());
     s_microOpResolver.AddDepthwiseConv2D(tflite::Register_CUSTOM_DEPTHWISE_CONV_INT4());
+#else
+    s_microOpResolver.AddConv2D();
+    s_microOpResolver.AddDepthwiseConv2D();
+#endif
 
     // Add MobileNetV1 Ops
     // s_microOpResolver.AddConv2D();

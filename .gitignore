@@ -5,3 +5,5 @@ Debug
 *Debug.launch
 *Release.launch
 .cproject
+*DS_Store
+.project

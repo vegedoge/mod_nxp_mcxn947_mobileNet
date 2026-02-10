@@ -21,6 +21,8 @@
 #include "tensorflow/lite/c/builtin_op_data.h"
 #include "tensorflow/lite/c/common.h"
 
+#include "demo_config.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -55,6 +57,7 @@ namespace tflite {
                                             const char* message,
                                             const char* data_fmt,
                                             ...) {
+#if DEBUG_PRINTS
       char data_buf[256];
       data_buf[0] = '\0';
       va_list args;
@@ -65,6 +68,13 @@ namespace tflite {
       printf("{\"sessionId\":\"debug-session\",\"runId\":\"%s\",\"hypothesisId\":\"%s\","
              "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":0}\r\n",
              run_id, hypothesis_id, location, message, data_buf);
+#else
+      (void)run_id;
+      (void)hypothesis_id;
+      (void)location;
+      (void)message;
+      (void)data_fmt;
+#endif
     }
 
     static inline uint32_t FloatBits(float v) {
@@ -146,8 +156,10 @@ namespace tflite {
       data->input_offset = -input->params.zero_point; 
 
       // 2. check this value, is it too large?
+#if DEBUG_PRINTS
       printf("DEBUG CHECK: Model ZeroPoint is %d, Calculated Offset is %ld\r\n", 
             input->params.zero_point, data->input_offset);
+#endif
 
       // if (input->dims->data[3] == 3) {
       //   printf("DEBUG: Detected First Layer (RGB). Forcing Input Offset to 1.\r\n");
@@ -300,7 +312,9 @@ namespace tflite {
       const int output_height = output->dims->data[1];
       const int output_width = output->dims->data[2];
       const int output_depth = output->dims->data[3]; // Conv2D output is dim[0]
+#if DEBUG_PRINTS
       printf("DEBUG: output_depth is: %d", output_depth);
+#endif
 
       const int stride_height = params->stride_height;
       const int stride_width = params->stride_width;
@@ -329,8 +343,10 @@ namespace tflite {
                 // if (out_channels == 0) {
                 //   acc = acc << 3;
                 // }
+#if DEBUG_PRINTS
                 printf("DEBUG: Initial Acc(bias) = %ld\r\n", acc);
                 printf("DEBUG: Input Offset = %ld\r\n", data->input_offset);
+#endif
               }
               
               if (debug_print && conv_debug_once == 0) {
@@ -424,12 +440,14 @@ namespace tflite {
                       // Only print first 10 macs
                       
                       if (debug_print && print_count < 27) {
+#if DEBUG_PRINTS
                           printf("  [%d] In=%d, Off=%ld, W_int4=%d, MAC+=%ld\r\n", 
                                 print_count, 
                                 input_val, 
                                 data->input_offset, 
                                 filter_val, 
                                 (int32_t)(input_val + data->input_offset) * filter_val);
+#endif
                           print_count++;
                       }
 
@@ -447,6 +465,7 @@ namespace tflite {
                     // 1. 打印累加器的值 (还没缩放前)
                     // 预期：Python算出来大概是正数 (因为 -69 - (-128) = 59)
                     // 如果这里是负数或者0，那就是 MAC 算错了
+#if DEBUG_PRINTS
                     printf("DEBUG CHECK:\r\n");
                     printf("  Acc (Before Quant) = %ld\r\n", acc);
                     
@@ -457,6 +476,7 @@ namespace tflite {
                     
                     // 3. 打印 Output Offset (应该约等于 -128)
                     printf("  Output Offset = %ld\r\n", data->output_offset);
+#endif
                   }
                 }
               }
@@ -485,14 +505,18 @@ namespace tflite {
                 // #endregion
               }
               if (b == 0 && out_y == 0 && out_x == 0 && out_channels == 0) {
+#if DEBUG_PRINTS
                   printf("  Final Result before clamping= %ld\r\n", acc);
+#endif
               }
               // clamp
               acc = std::max(acc, data->output_activation_min);
               acc = std::min(acc, data->output_activation_max);
 
               if (b == 0 && out_y == 0 && out_x == 0 && out_channels == 0) {
+#if DEBUG_PRINTS
                   printf("  Final Result = %ld\r\n", acc);
+#endif
               }
 
               // store output
@@ -513,6 +537,7 @@ namespace tflite {
 
       // compare the output with python, only first layer
       if (input_depth == 3) {
+#if DEBUG_PRINTS
         printf("\r\n[MCU DEBUG] Layer 1 (Conv2D) Output First 16 bytes:\r\n");
         for (int i = 0; i < 16; i++) {
             // force to int
@@ -523,6 +548,7 @@ namespace tflite {
         // 打印完直接死循环卡住，方便我们看日志，防止被后面刷屏
         // 确认第一层对了，再把这行删掉
         // while(1) {}; 
+#endif
       }
 
       return kTfLiteOk;

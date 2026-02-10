@@ -36,6 +36,7 @@ int main(void)
     tensor_type_t outputType;
     uint8_t* outputData = MODEL_GetOutputTensorData(&outputDims, &outputType);
 
+#if DEBUG_PRINTS
     // ============ Print model info ============
     PRINTF("--- TFLite model info ---\r\n");
     PRINTF("Input B: %d, H: %d, W: %d, C: %d\n", 
@@ -47,6 +48,15 @@ int main(void)
     PRINTF("Output type: %d (0=kTfLiteFloat32, 1=kTfLiteUint8, 2=kTfLiteInt8)\n", outputType);
     PRINTF("--------------------------\r\n");
     // ========================================
+#endif
+
+#if ENABLE_BATCH_TEST
+    if (MODEL_RunBatchTest() != kStatus_Success)
+    {
+        PRINTF("Batch test failed" EOL);
+    }
+    for (;;) {}
+#endif
 
     while (1)
     {
