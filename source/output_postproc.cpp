@@ -23,9 +23,8 @@ status_t MODEL_ProcessOutput(const uint8_t* data, const tensor_dims_t* dims,
     float confidence = 0.0f;
     int top_index = -1;
 
-    // For INT8 outputs, align confidence with Python baseline:
-    // 1) dequantize via output tensor scale/zero_point
-    // 2) run softmax on dequantized logits
+    // For INT8 outputs: model already includes Softmax, so the dequantized
+    // output values ARE probabilities. Just dequantize and pick the max.
     if (type == kTensorType_INT8) {
         const int num_classes = dims->data[dims->size - 1];
         const int8_t* raw_logits = reinterpret_cast<const int8_t*>(data);
@@ -34,25 +33,16 @@ status_t MODEL_ProcessOutput(const uint8_t* data, const tensor_dims_t* dims,
         if (MODEL_GetOutputQuantParams(&out_scale, &out_zero_point) != kStatus_Success) {
             PRINTF("Failed to get output quant params, fallback to GetTopN" EOL);
         } else {
-            float max_logit = -1e30f;
+            float max_prob = -1.0f;
             for (int i = 0; i < num_classes; ++i) {
-                const float deq = (static_cast<float>(raw_logits[i]) - static_cast<float>(out_zero_point)) * out_scale;
-                if (deq > max_logit) {
-                    max_logit = deq;
+                const float prob = (static_cast<float>(raw_logits[i]) - static_cast<float>(out_zero_point)) * out_scale;
+                if (prob > max_prob) {
+                    max_prob = prob;
                     top_index = i;
                 }
             }
-
-            float sum_exp = 0.0f;
-            for (int i = 0; i < num_classes; ++i) {
-                const float deq = (static_cast<float>(raw_logits[i]) - static_cast<float>(out_zero_point)) * out_scale;
-                sum_exp += expf(deq - max_logit);
-            }
-
-            if (sum_exp > 0.0f && top_index >= 0) {
-                const float top_deq =
-                    (static_cast<float>(raw_logits[top_index]) - static_cast<float>(out_zero_point)) * out_scale;
-                confidence = expf(top_deq - max_logit) / sum_exp;
+            if (top_index >= 0) {
+                confidence = max_prob;
                 if (confidence > threshold) {
                     label = labels[top_index];
                 }
@@ -80,26 +70,14 @@ status_t MODEL_ProcessOutput(const uint8_t* data, const tensor_dims_t* dims,
     }
     PRINTF("----------------------------------------" EOL);
 
-    // Raw output to compare
-    const int8_t* raw_logits = reinterpret_cast<const int8_t*>(data);
-    int num_classes = dims->data[dims->size - 1];
-
-    PRINTF("Raw model output logits:" EOL);
-    for (int i = 0; i < num_classes; i++)
-    {
-        int val = static_cast<int>(raw_logits[i]);
-        
-        // fix negative values
-        if (val < 0)
-        {
-            PRINTF("Class %2d: -%d" EOL, i, -val);
-        }
-        else
-        {
-            PRINTF("Class %2d:  %d" EOL, i, val);
-        }
-    }
-    PRINTF("----------------------------------------" EOL);
+    // Raw output for debugging (uncomment when needed)
+    // {
+    //     const int8_t* raw = reinterpret_cast<const int8_t*>(data);
+    //     int nc = dims->data[dims->size - 1];
+    //     PRINTF("Raw logits:");
+    //     for (int i = 0; i < nc; i++) PRINTF(" %d", (int)raw[i]);
+    //     PRINTF(EOL);
+    // }
 
 #ifdef EIQ_GUI_PRINTF
     GUI_PrintfToBuffer(GUI_X_POS, GUI_Y_POS, "Detected: %.20s (%d%%)", label, score);

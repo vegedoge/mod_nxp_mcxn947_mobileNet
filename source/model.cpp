@@ -28,11 +28,19 @@ limitations under the License.
 #include "output_postproc.h"
 #include "timer.h"
 
-// Model selection is controlled by demo_config.h
-#if USE_INT4_CUSTOM_PATH
-#include "model_data.h"
-#else
-#include "model_data_int8.h"
+// Model data selection: MODEL_SELECT x USE_INT4_CUSTOM_PATH
+#if MODEL_SELECT == 0  // ResNet-20
+  #if USE_INT4_CUSTOM_PATH
+    #include "model_data.h"
+  #else
+    #include "model_data_int8.h"
+  #endif
+#elif MODEL_SELECT == 1  // MobileNet-v1
+  #if USE_INT4_CUSTOM_PATH
+    #include "model_data_mobilenet.h"
+  #else
+    #include "model_data_mobilenet_int8.h"
+  #endif
 #endif
 
 // post-processed input
