@@ -24,7 +24,7 @@
 #define NUM_RESULTS        1
 #define DEMO_VERBOSE       false
 #define EOL                "\r\n"
-#define DEBUG_PRINTS       0
+#define DEBUG_PRINTS       1
 #define ENABLE_BATCH_TEST  1
 #define BATCH_TEST_PRINT_EVERY 1
 

@@ -225,6 +225,15 @@ status_t MODEL_RunBatchTest(void)
                                 &output_dims, output_type, inference_time);
         }
 
+#if DEBUG_PRINTS
+        // Log per-layer profiling after sample 5 (serial is connected by then)
+        if (i == 5) {
+            PRINTF("--- Operator Profiling Results ---\r\n");
+            s_custom_profiler.LogResults();
+            PRINTF("--- Profiling Ends ---\r\n");
+        }
+#endif
+
     }
 
     return kStatus_Success;
