@@ -38,7 +38,9 @@ limitations under the License.
     #include "model_data_int8.h"
   #endif
 #elif MODEL_SELECT == 1  // MobileNet-v1
-  #if USE_INT4_CUSTOM_PATH == 2
+  #if USE_INT4_CUSTOM_PATH == 3
+    #include "model_data_mobilenet_hybrid.h"
+  #elif USE_INT4_CUSTOM_PATH == 2
     #include "model_data_mobilenet_cmsis.h"
   #elif USE_INT4_CUSTOM_PATH == 1
     #include "model_data_mobilenet.h"

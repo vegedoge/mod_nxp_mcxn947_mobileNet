@@ -26,7 +26,7 @@ tflite::MicroOpResolver &MODEL_GetOpsResolver()
     static tflite::MicroMutableOpResolver<10> s_microOpResolver;
 
     // Conv2D: both models need this
-#if USE_INT4_CUSTOM_PATH == 2
+#if USE_INT4_CUSTOM_PATH == 2 || USE_INT4_CUSTOM_PATH == 3
     s_microOpResolver.AddConv2D(tflite::Register_CONV_2D_INT4());
 #elif USE_INT4_CUSTOM_PATH == 1
     s_microOpResolver.AddConv2D(tflite::Register_CUSTOM_CONV_INT4());
@@ -37,8 +37,11 @@ tflite::MicroOpResolver &MODEL_GetOpsResolver()
 #if MODEL_SELECT == 0  // ResNet-20: residual connections
     s_microOpResolver.AddAdd();
 #elif MODEL_SELECT == 1  // MobileNet-v1: depthwise separable convs
-  #if USE_INT4_CUSTOM_PATH == 2
-    // CMSIS-NN INT4: no dedicated DepthwiseConv2D INT4 yet, use builtin
+  #if USE_INT4_CUSTOM_PATH == 3
+    // Hybrid: CMSIS-NN INT4 Conv2D + custom INT4 DepthwiseConv2D
+    s_microOpResolver.AddDepthwiseConv2D(tflite::Register_CUSTOM_DEPTHWISE_CONV_INT4());
+  #elif USE_INT4_CUSTOM_PATH == 2
+    // CMSIS-NN INT4 Conv2D + builtin INT8 DepthwiseConv2D (mixed precision)
     s_microOpResolver.AddDepthwiseConv2D();
   #elif USE_INT4_CUSTOM_PATH == 1
     s_microOpResolver.AddDepthwiseConv2D(tflite::Register_CUSTOM_DEPTHWISE_CONV_INT4());
