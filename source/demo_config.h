@@ -32,7 +32,7 @@
 // 0 -> INT8 baseline (model_data_int8.h + builtin Conv/Depthwise)
 // 1 -> INT4 custom kernel (model_data.h + custom INT4 Conv/Depthwise)
 // 2 -> INT4 CMSIS-NN Conv2D + INT8 DepthwiseConv2D (mixed precision)
-// 3 -> INT4 CMSIS-NN Conv2D + custom INT4 DepthwiseConv2D (full INT4 hybrid)
-#define USE_INT4_CUSTOM_PATH 0
+// 3 -> INT4 CMSIS-NN Conv2D + CMSIS-NN INT4 DepthwiseConv2D (full CMSIS-NN INT4)
+#define USE_INT4_CUSTOM_PATH 3
 
 #endif // _DEMO_CONFIG_H_

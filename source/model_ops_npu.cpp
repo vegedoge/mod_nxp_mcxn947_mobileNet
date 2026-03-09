@@ -9,8 +9,9 @@
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/kernels/neutron/neutron.h"
 
-// Header files for ResNet-20 model ops
+// Header files for model ops
 #include "tensorflow/lite/micro/kernels/conv.h"
+#include "tensorflow/lite/micro/kernels/depthwise_conv.h"
 #include "tensorflow/lite/micro/kernels/fully_connected.h"
 #include "tensorflow/lite/micro/kernels/softmax.h"
 #include "tensorflow/lite/micro/kernels/reshape.h"
@@ -38,8 +39,8 @@ tflite::MicroOpResolver &MODEL_GetOpsResolver()
     s_microOpResolver.AddAdd();
 #elif MODEL_SELECT == 1  // MobileNet-v1: depthwise separable convs
   #if USE_INT4_CUSTOM_PATH == 3
-    // Hybrid: CMSIS-NN INT4 Conv2D + custom INT4 DepthwiseConv2D
-    s_microOpResolver.AddDepthwiseConv2D(tflite::Register_CUSTOM_DEPTHWISE_CONV_INT4());
+    // Full CMSIS-NN INT4: both Conv2D and DepthwiseConv2D use CMSIS-NN INT4 kernels
+    s_microOpResolver.AddDepthwiseConv2D(tflite::Register_DEPTHWISE_CONV_2D_INT4());
   #elif USE_INT4_CUSTOM_PATH == 2
     // CMSIS-NN INT4 Conv2D + builtin INT8 DepthwiseConv2D (mixed precision)
     s_microOpResolver.AddDepthwiseConv2D();
