@@ -174,8 +174,10 @@ TfLiteStatus PreunpackConvPrepare(TfLiteContext* context, TfLiteNode* node) {
     // No *16 — model already has true INT4 scales from --target cmsis
     const double eff_scale =
         input_scale * static_cast<double>(filter_scales[i]) / output_scale;
+    int shift_tmp;
     QuantizeMultiplier(eff_scale, &data->per_channel_multiplier[i],
-                       &data->per_channel_shift[i]);
+                       &shift_tmp);
+    data->per_channel_shift[i] = static_cast<int32_t>(shift_tmp);
   }
 
   // Determine if this layer fits in the pre-unpack buffer

@@ -30,7 +30,7 @@ limitations under the License.
 
 // Model data selection: MODEL_SELECT x USE_INT4_CUSTOM_PATH
 #if MODEL_SELECT == 0  // ResNet-20
-  #if USE_INT4_CUSTOM_PATH == 2
+  #if USE_INT4_CUSTOM_PATH == 4 || USE_INT4_CUSTOM_PATH == 2
     #include "model_data_cmsis.h"
   #elif USE_INT4_CUSTOM_PATH == 1
     #include "model_data.h"
@@ -40,7 +40,7 @@ limitations under the License.
 #elif MODEL_SELECT == 1  // MobileNet-v1
   #if USE_INT4_CUSTOM_PATH == 3
     #include "model_data_mobilenet_hybrid.h"
-  #elif USE_INT4_CUSTOM_PATH == 2
+  #elif USE_INT4_CUSTOM_PATH == 4 || USE_INT4_CUSTOM_PATH == 2
     #include "model_data_mobilenet_cmsis.h"
   #elif USE_INT4_CUSTOM_PATH == 1
     #include "model_data_mobilenet.h"
