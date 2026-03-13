@@ -33,6 +33,12 @@
 // 1 -> INT4 custom kernel (model_data.h + custom INT4 Conv/Depthwise)
 // 2 -> INT4 CMSIS-NN Conv2D + INT8 DepthwiseConv2D (mixed precision)
 // 3 -> INT4 CMSIS-NN Conv2D + CMSIS-NN INT4 DepthwiseConv2D (full CMSIS-NN INT4)
-#define USE_INT4_CUSTOM_PATH 3
+// 4 -> INT4 pre-unpack Conv2D (unpack to SRAM -> INT8 CMSIS-NN) + INT8 DepthwiseConv2D
+#define USE_INT4_CUSTOM_PATH 4
+
+// Scratch buffer size for INT4->INT8 pre-unpack (KB).
+// Layers with INT8 weight size <= this use fast s8 path; others fall back to s4.
+// MobileNet-v1 a0.5: 64KB covers all but last PW conv (256->512 = 128KB).
+#define PREUNPACK_SCRATCH_KB 64
 
 #endif // _DEMO_CONFIG_H_
