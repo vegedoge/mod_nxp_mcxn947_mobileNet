@@ -28,6 +28,7 @@
 
 // CMSIS-NN
 #include "arm_nnfunctions.h"
+#include "arm_nnsupportfunctions.h"
 
 #include <string.h>
 
@@ -60,6 +61,9 @@ struct PreunpackConvOpData {
   // Whether this layer fits in the pre-unpack buffer
   bool use_s8_fast;
 
+  // Whether this is a 1×1 convolution (eligible for fused SMLAD path)
+  bool is_1x1;
+
   // Number of INT8 weight bytes (C_out * KH * KW * C_in)
   int weight_bytes_int8;
 };
@@ -88,6 +92,100 @@ static void unpack_int4_to_int8(const int8_t* packed, int8_t* unpacked,
     int8_t lo = static_cast<int8_t>((byte & 0x0F));
     if (lo & 0x08) lo |= 0xF0;
     unpacked[num_elements - 1] = lo;
+  }
+}
+
+// ── Fused INT4 1×1 Conv2D ──
+// Reads INT4 weights directly from Flash, unpacks in registers, computes MAC.
+// No SRAM scratch buffer needed — works for arbitrarily large layers.
+// Only valid for 1×1 convolutions (no padding, no im2col).
+//
+// Phase 1: C implementation for correctness verification.
+// Phase 2: Optimize inner loop with SMLAD intrinsics / inline assembly.
+__attribute__((optimize("O2")))
+static void conv_1x1_fused_s4(
+    const int8_t* input,        // [H*W, C_in] INT8
+    const int8_t* packed_w,     // [C_out, C_in/2] INT4 packed
+    const int32_t* bias,        // [C_out]
+    int8_t* output,             // [H*W, C_out] INT8
+    int num_pixels,             // H * W
+    int c_in,                   // input channels (must be multiple of 4)
+    int c_out,                  // output channels
+    int32_t input_offset,       // -input_zero_point
+    const int32_t* multiplier,  // per-channel requant multiplier
+    const int32_t* shift,       // per-channel requant shift
+    int32_t output_offset,      // output zero point
+    int32_t act_min,
+    int32_t act_max) {
+  const uint8_t* w_base = reinterpret_cast<const uint8_t*>(packed_w);
+  const int c_in_packed = c_in / 2;  // packed bytes per output channel
+
+  for (int px = 0; px < num_pixels; px++) {
+    const int8_t* a_row = input + px * c_in;
+
+    for (int oc = 0; oc < c_out; oc++) {
+      int32_t acc = bias ? bias[oc] : 0;
+      const uint8_t* w_row = w_base + oc * c_in_packed;
+
+      // Process 4 INT4 weights (2 bytes) per iteration, using SMLAD dual-MAC
+      int j = 0;
+      for (; j + 3 < c_in; j += 4) {
+        // Load 2 packed bytes = 4 INT4 weights
+        uint32_t packed =
+            *reinterpret_cast<const uint16_t*>(w_row + j / 2);
+
+        // Extract and sign-extend 4 nibbles using SBFX
+        int32_t w0, w1, w2, w3;
+        __ASM volatile("sbfx %0, %1, #0, #4"  : "=r"(w0) : "r"(packed));
+        __ASM volatile("sbfx %0, %1, #4, #4"  : "=r"(w1) : "r"(packed));
+        __ASM volatile("sbfx %0, %1, #8, #4"  : "=r"(w2) : "r"(packed));
+        __ASM volatile("sbfx %0, %1, #12, #4" : "=r"(w3) : "r"(packed));
+
+        // Load 4 activations + input_offset
+        int32_t a0 = a_row[j]     + input_offset;
+        int32_t a1 = a_row[j + 1] + input_offset;
+        int32_t a2 = a_row[j + 2] + input_offset;
+        int32_t a3 = a_row[j + 3] + input_offset;
+
+        // Pack pairs for SMLAD: {hi16, lo16}
+        uint32_t wp02, wp13, ap02, ap13;
+        __ASM volatile("pkhbt %0, %1, %2, lsl #16"
+                        : "=r"(wp02) : "r"(w0), "r"(w2));
+        __ASM volatile("pkhbt %0, %1, %2, lsl #16"
+                        : "=r"(wp13) : "r"(w1), "r"(w3));
+        __ASM volatile("pkhbt %0, %1, %2, lsl #16"
+                        : "=r"(ap02) : "r"(a0), "r"(a2));
+        __ASM volatile("pkhbt %0, %1, %2, lsl #16"
+                        : "=r"(ap13) : "r"(a1), "r"(a3));
+
+        // Dual MACs: acc += w0*a0 + w2*a2, then acc += w1*a1 + w3*a3
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc) : "r"(wp02), "r"(ap02));
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc) : "r"(wp13), "r"(ap13));
+      }
+
+      // Handle remaining channels (< 4)
+      for (; j < c_in; j++) {
+        const uint8_t byte = w_row[j / 2];
+        int8_t w;
+        if (j % 2 == 0) {
+          w = static_cast<int8_t>(byte & 0x0F);
+          if (w & 0x08) w |= 0xF0;
+        } else {
+          w = static_cast<int8_t>((byte >> 4) & 0x0F);
+          if (w & 0x08) w |= 0xF0;
+        }
+        acc += w * (static_cast<int32_t>(a_row[j]) + input_offset);
+      }
+
+      // Per-channel requantize
+      acc = arm_nn_requantize(acc, multiplier[oc], shift[oc]);
+      acc += output_offset;
+      acc = MAX(acc, act_min);
+      acc = MIN(acc, act_max);
+      output[px * c_out + oc] = static_cast<int8_t>(acc);
+    }
   }
 }
 
@@ -184,6 +282,13 @@ TfLiteStatus PreunpackConvPrepare(TfLiteContext* context, TfLiteNode* node) {
   data->weight_bytes_int8 = output_ch * filter_h * filter_w * input_ch;
   data->use_s8_fast =
       (data->weight_bytes_int8 <= PREUNPACK_SCRATCH_KB * 1024);
+
+  // Check if eligible for fused SMLAD path (1×1 conv, no padding, stride 1)
+  data->is_1x1 = (filter_h == 1 && filter_w == 1 &&
+                   params->stride_height == 1 && params->stride_width == 1 &&
+                   params->dilation_height_factor == 1 &&
+                   params->dilation_width_factor == 1 &&
+                   (input_ch % 4 == 0));  // need multiple of 4 for SMLAD loop
 
   // Request scratch buffer for CMSIS-NN s8 wrapper (internal im2col etc.)
   {
@@ -305,6 +410,17 @@ TfLiteStatus PreunpackConvEval(TfLiteContext* context, TfLiteNode* node) {
                             &filt_dims, s_preunpack_buf,
                             &bias_dims, bias_data,
                             &out_dims, output_data);
+  } else if (data->is_1x1) {
+    // ── Fused path: INT4 unpack in registers + SMLAD, no SRAM buffer ──
+    // For 1×1 convolutions that don't fit in pre-unpack scratch.
+    conv_1x1_fused_s4(input_data, filter_data, bias_data, output_data,
+                      output_h * output_w,  // num_pixels
+                      input_ch, output_ch,
+                      data->input_offset,
+                      data->per_channel_multiplier,
+                      data->per_channel_shift,
+                      data->output_offset,
+                      data->activation_min, data->activation_max);
   } else {
     // ── Fallback: call s4 wrapper directly on packed INT4 weights ──
 
