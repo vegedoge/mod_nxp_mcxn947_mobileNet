@@ -95,13 +95,16 @@ static void unpack_int4_to_int8(const int8_t* packed, int8_t* unpacked,
   }
 }
 
-// ── Fused INT4 1×1 Conv2D ──
-// Reads INT4 weights directly from Flash, unpacks in registers, computes MAC.
+// ── Fused INT4 1×1 Conv2D (optimized) ──
+// Reads INT4 weights directly from Flash, unpacks in registers, uses SMLAD.
 // No SRAM scratch buffer needed — works for arbitrarily large layers.
 // Only valid for 1×1 convolutions (no padding, no im2col).
 //
-// Phase 1: C implementation for correctness verification.
-// Phase 2: Optimize inner loop with SMLAD intrinsics / inline assembly.
+// Optimizations (matching CMSIS-NN s4 DSP techniques):
+//   - SXTAB16 for fused sign-extend + offset addition (1 insn vs 4 ADDs)
+//   - read_and_pad_s4 style nibble extraction
+//   - 2-pixel batching to amortize weight loads
+//   - 2×2 block: 2 pixels × 1 output channel with weight reuse
 __attribute__((optimize("O2")))
 static void conv_1x1_fused_s4(
     const int8_t* input,        // [H*W, C_in] INT8
@@ -117,74 +120,236 @@ static void conv_1x1_fused_s4(
     int32_t output_offset,      // output zero point
     int32_t act_min,
     int32_t act_max) {
-  const uint8_t* w_base = reinterpret_cast<const uint8_t*>(packed_w);
-  const int c_in_packed = c_in / 2;  // packed bytes per output channel
+  const int8_t* w_base = packed_w;
+  const int c_in_packed = c_in / 2;
 
-  for (int px = 0; px < num_pixels; px++) {
-    const int8_t* a_row = input + px * c_in;
+  // Pack input_offset as two int16 halves for SXTAB16
+  const int16_t i16_offset = static_cast<int16_t>(input_offset);
+  uint32_t offset_i16x2;
+  __ASM volatile("pkhbt %0, %1, %1, lsl #16"
+                  : "=r"(offset_i16x2) : "r"((int32_t)i16_offset));
+
+  // Process 2 pixels at a time for weight reuse
+  int px = 0;
+  for (; px + 1 < num_pixels; px += 2) {
+    const int8_t* a_row0 = input + px * c_in;
+    const int8_t* a_row1 = input + (px + 1) * c_in;
 
     for (int oc = 0; oc < c_out; oc++) {
-      int32_t acc = bias ? bias[oc] : 0;
-      const uint8_t* w_row = w_base + oc * c_in_packed;
+      int32_t acc0 = bias ? bias[oc] : 0;  // pixel 0
+      int32_t acc1 = acc0;                   // pixel 1 (same bias)
+      const int8_t* w_ptr = w_base + oc * c_in_packed;
 
-      // Process 4 INT4 weights (2 bytes) per iteration, using SMLAD dual-MAC
-      int j = 0;
-      for (; j + 3 < c_in; j += 4) {
-        // Load 2 packed bytes = 4 INT4 weights
-        uint32_t packed =
-            *reinterpret_cast<const uint16_t*>(w_row + j / 2);
+      // Inner loop: 4 weights per iteration
+      for (int j = 0; j < c_in; j += 4) {
+        // ── Unpack 4 INT4 weights using SBFX ──
+        uint32_t in16;
+        __ASM volatile("ldrh %0, [%1]" : "=r"(in16) : "r"(w_ptr));
+        w_ptr += 2;
 
-        // Extract and sign-extend 4 nibbles using SBFX
         int32_t w0, w1, w2, w3;
-        __ASM volatile("sbfx %0, %1, #0, #4"  : "=r"(w0) : "r"(packed));
-        __ASM volatile("sbfx %0, %1, #4, #4"  : "=r"(w1) : "r"(packed));
-        __ASM volatile("sbfx %0, %1, #8, #4"  : "=r"(w2) : "r"(packed));
-        __ASM volatile("sbfx %0, %1, #12, #4" : "=r"(w3) : "r"(packed));
+        __ASM volatile("sbfx %0, %1, #0, #4"  : "=r"(w0) : "r"(in16));
+        __ASM volatile("sbfx %0, %1, #4, #4"  : "=r"(w1) : "r"(in16));
+        __ASM volatile("sbfx %0, %1, #8, #4"  : "=r"(w2) : "r"(in16));
+        __ASM volatile("sbfx %0, %1, #12, #4" : "=r"(w3) : "r"(in16));
 
-        // Load 4 activations + input_offset
-        int32_t a0 = a_row[j]     + input_offset;
-        int32_t a1 = a_row[j + 1] + input_offset;
-        int32_t a2 = a_row[j + 2] + input_offset;
-        int32_t a3 = a_row[j + 3] + input_offset;
-
-        // Pack pairs for SMLAD: {hi16, lo16}
-        uint32_t wp02, wp13, ap02, ap13;
+        // Pack weights for SMLAD: {w2, w0} and {w3, w1}
+        uint32_t wp02, wp13;
         __ASM volatile("pkhbt %0, %1, %2, lsl #16"
                         : "=r"(wp02) : "r"(w0), "r"(w2));
         __ASM volatile("pkhbt %0, %1, %2, lsl #16"
                         : "=r"(wp13) : "r"(w1), "r"(w3));
-        __ASM volatile("pkhbt %0, %1, %2, lsl #16"
-                        : "=r"(ap02) : "r"(a0), "r"(a2));
-        __ASM volatile("pkhbt %0, %1, %2, lsl #16"
-                        : "=r"(ap13) : "r"(a1), "r"(a3));
 
-        // Dual MACs: acc += w0*a0 + w2*a2, then acc += w1*a1 + w3*a3
+        // ── Load activations for pixel 0 with SXTAB16 (fused extend + offset) ──
+        uint32_t lhs_raw0 = *reinterpret_cast<const uint32_t*>(a_row0 + j);
+        uint32_t lhs_low0, lhs_high0;
+        __ASM volatile("sxtab16 %0, %1, %2"
+                        : "=r"(lhs_low0) : "r"(offset_i16x2), "r"(lhs_raw0));
+        __ASM volatile("sxtab16 %0, %1, %2, ror #8"
+                        : "=r"(lhs_high0) : "r"(offset_i16x2), "r"(lhs_raw0));
+
+        // MAC for pixel 0: acc0 += w0*a0 + w2*a2, then w1*a1 + w3*a3
         __ASM volatile("smlad %0, %1, %2, %0"
-                        : "+r"(acc) : "r"(wp02), "r"(ap02));
+                        : "+r"(acc0) : "r"(wp02), "r"(lhs_low0));
         __ASM volatile("smlad %0, %1, %2, %0"
-                        : "+r"(acc) : "r"(wp13), "r"(ap13));
+                        : "+r"(acc0) : "r"(wp13), "r"(lhs_high0));
+
+        // ── Load activations for pixel 1 (reuse weights) ──
+        uint32_t lhs_raw1 = *reinterpret_cast<const uint32_t*>(a_row1 + j);
+        uint32_t lhs_low1, lhs_high1;
+        __ASM volatile("sxtab16 %0, %1, %2"
+                        : "=r"(lhs_low1) : "r"(offset_i16x2), "r"(lhs_raw1));
+        __ASM volatile("sxtab16 %0, %1, %2, ror #8"
+                        : "=r"(lhs_high1) : "r"(offset_i16x2), "r"(lhs_raw1));
+
+        // MAC for pixel 1 (weights already unpacked!)
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc1) : "r"(wp02), "r"(lhs_low1));
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc1) : "r"(wp13), "r"(lhs_high1));
       }
 
-      // Handle remaining channels (< 4)
-      for (; j < c_in; j++) {
-        const uint8_t byte = w_row[j / 2];
-        int8_t w;
-        if (j % 2 == 0) {
-          w = static_cast<int8_t>(byte & 0x0F);
-          if (w & 0x08) w |= 0xF0;
-        } else {
-          w = static_cast<int8_t>((byte >> 4) & 0x0F);
-          if (w & 0x08) w |= 0xF0;
-        }
-        acc += w * (static_cast<int32_t>(a_row[j]) + input_offset);
+      // Requantize pixel 0
+      acc0 = arm_nn_requantize(acc0, multiplier[oc], shift[oc]);
+      acc0 += output_offset;
+      acc0 = MAX(acc0, act_min);
+      acc0 = MIN(acc0, act_max);
+      output[px * c_out + oc] = static_cast<int8_t>(acc0);
+
+      // Requantize pixel 1
+      acc1 = arm_nn_requantize(acc1, multiplier[oc], shift[oc]);
+      acc1 += output_offset;
+      acc1 = MAX(acc1, act_min);
+      acc1 = MIN(acc1, act_max);
+      output[(px + 1) * c_out + oc] = static_cast<int8_t>(acc1);
+    }
+  }
+
+  // Handle last pixel if num_pixels is odd
+  if (px < num_pixels) {
+    const int8_t* a_row = input + px * c_in;
+    for (int oc = 0; oc < c_out; oc++) {
+      int32_t acc = bias ? bias[oc] : 0;
+      const int8_t* w_ptr = w_base + oc * c_in_packed;
+
+      for (int j = 0; j < c_in; j += 4) {
+        uint32_t in16;
+        __ASM volatile("ldrh %0, [%1]" : "=r"(in16) : "r"(w_ptr));
+        w_ptr += 2;
+
+        int32_t w0, w1, w2, w3;
+        __ASM volatile("sbfx %0, %1, #0, #4"  : "=r"(w0) : "r"(in16));
+        __ASM volatile("sbfx %0, %1, #4, #4"  : "=r"(w1) : "r"(in16));
+        __ASM volatile("sbfx %0, %1, #8, #4"  : "=r"(w2) : "r"(in16));
+        __ASM volatile("sbfx %0, %1, #12, #4" : "=r"(w3) : "r"(in16));
+
+        uint32_t wp02, wp13;
+        __ASM volatile("pkhbt %0, %1, %2, lsl #16"
+                        : "=r"(wp02) : "r"(w0), "r"(w2));
+        __ASM volatile("pkhbt %0, %1, %2, lsl #16"
+                        : "=r"(wp13) : "r"(w1), "r"(w3));
+
+        uint32_t lhs_raw = *reinterpret_cast<const uint32_t*>(a_row + j);
+        uint32_t lhs_low, lhs_high;
+        __ASM volatile("sxtab16 %0, %1, %2"
+                        : "=r"(lhs_low) : "r"(offset_i16x2), "r"(lhs_raw));
+        __ASM volatile("sxtab16 %0, %1, %2, ror #8"
+                        : "=r"(lhs_high) : "r"(offset_i16x2), "r"(lhs_raw));
+
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc) : "r"(wp02), "r"(lhs_low));
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc) : "r"(wp13), "r"(lhs_high));
       }
 
-      // Per-channel requantize
       acc = arm_nn_requantize(acc, multiplier[oc], shift[oc]);
       acc += output_offset;
       acc = MAX(acc, act_min);
       acc = MIN(acc, act_max);
       output[px * c_out + oc] = static_cast<int8_t>(acc);
+    }
+  }
+}
+
+// ── Fused INT4 general Conv2D (for 3×3 etc.) ──
+// Direct convolution: no im2col, no SRAM buffer.
+// Iterates over kernel spatial positions, reads INT4 weights from Flash.
+__attribute__((optimize("O2")))
+static void conv_general_fused_s4(
+    const int8_t* input,        // [H_in, W_in, C_in]
+    const int8_t* packed_w,     // [C_out, KH, KW, C_in / 2] INT4 packed
+    const int32_t* bias,
+    int8_t* output,             // [H_out, W_out, C_out]
+    int input_h, int input_w, int input_ch,
+    int output_h, int output_w, int output_ch,
+    int filter_h, int filter_w,
+    int stride_h, int stride_w,
+    int pad_h, int pad_w,
+    int32_t input_offset,
+    const int32_t* multiplier,
+    const int32_t* shift,
+    int32_t output_offset,
+    int32_t act_min, int32_t act_max) {
+  const int filter_ch_packed = filter_h * filter_w * input_ch / 2;
+
+  // Pack input_offset for SXTAB16
+  const int16_t i16_offset = static_cast<int16_t>(input_offset);
+  uint32_t offset_i16x2;
+  __ASM volatile("pkhbt %0, %1, %1, lsl #16"
+                  : "=r"(offset_i16x2) : "r"((int32_t)i16_offset));
+
+  for (int out_y = 0; out_y < output_h; out_y++) {
+    for (int out_x = 0; out_x < output_w; out_x++) {
+      const int in_y_origin = out_y * stride_h - pad_h;
+      const int in_x_origin = out_x * stride_w - pad_w;
+
+      for (int oc = 0; oc < output_ch; oc++) {
+        int32_t acc = bias ? bias[oc] : 0;
+        const uint8_t* w_ptr =
+            reinterpret_cast<const uint8_t*>(packed_w) + oc * filter_ch_packed;
+
+        for (int fy = 0; fy < filter_h; fy++) {
+          const int in_y = in_y_origin + fy;
+          if (in_y < 0 || in_y >= input_h) {
+            // Skip entire filter row: padded value = zero_point,
+            // (zero_point + input_offset) = 0, so contribution is 0.
+            w_ptr += filter_w * (input_ch / 2);
+            continue;
+          }
+
+          for (int fx = 0; fx < filter_w; fx++) {
+            const int in_x = in_x_origin + fx;
+            if (in_x < 0 || in_x >= input_w) {
+              w_ptr += input_ch / 2;
+              continue;
+            }
+
+            const int8_t* a_ptr =
+                input + (in_y * input_w + in_x) * input_ch;
+
+            // Inner MAC loop: same SBFX + SXTAB16 + SMLAD as 1×1
+            for (int ic = 0; ic < input_ch; ic += 4) {
+              uint32_t in16;
+              __ASM volatile("ldrh %0, [%1]" : "=r"(in16) : "r"(w_ptr));
+              w_ptr += 2;
+
+              int32_t w0, w1, w2, w3;
+              __ASM volatile("sbfx %0, %1, #0, #4"  : "=r"(w0) : "r"(in16));
+              __ASM volatile("sbfx %0, %1, #4, #4"  : "=r"(w1) : "r"(in16));
+              __ASM volatile("sbfx %0, %1, #8, #4"  : "=r"(w2) : "r"(in16));
+              __ASM volatile("sbfx %0, %1, #12, #4" : "=r"(w3) : "r"(in16));
+
+              uint32_t wp02, wp13;
+              __ASM volatile("pkhbt %0, %1, %2, lsl #16"
+                              : "=r"(wp02) : "r"(w0), "r"(w2));
+              __ASM volatile("pkhbt %0, %1, %2, lsl #16"
+                              : "=r"(wp13) : "r"(w1), "r"(w3));
+
+              uint32_t lhs_raw =
+                  *reinterpret_cast<const uint32_t*>(a_ptr + ic);
+              uint32_t lhs_low, lhs_high;
+              __ASM volatile("sxtab16 %0, %1, %2"
+                              : "=r"(lhs_low)
+                              : "r"(offset_i16x2), "r"(lhs_raw));
+              __ASM volatile("sxtab16 %0, %1, %2, ror #8"
+                              : "=r"(lhs_high)
+                              : "r"(offset_i16x2), "r"(lhs_raw));
+
+              __ASM volatile("smlad %0, %1, %2, %0"
+                              : "+r"(acc) : "r"(wp02), "r"(lhs_low));
+              __ASM volatile("smlad %0, %1, %2, %0"
+                              : "+r"(acc) : "r"(wp13), "r"(lhs_high));
+            }
+          }
+        }
+
+        acc = arm_nn_requantize(acc, multiplier[oc], shift[oc]);
+        acc += output_offset;
+        acc = MAX(acc, act_min);
+        acc = MIN(acc, act_max);
+        output[(out_y * output_w + out_x) * output_ch + oc] =
+            static_cast<int8_t>(acc);
+      }
     }
   }
 }
@@ -421,9 +586,23 @@ TfLiteStatus PreunpackConvEval(TfLiteContext* context, TfLiteNode* node) {
                       data->per_channel_shift,
                       data->output_offset,
                       data->activation_min, data->activation_max);
+  } else if (input_ch % 4 == 0) {
+    // ── General fused path: direct conv with INT4 unpack + SMLAD ──
+    // No SRAM buffer, no im2col. Works for any kernel size.
+    // Requires input_ch multiple of 4 for SMLAD inner loop.
+    conv_general_fused_s4(input_data, filter_data, bias_data, output_data,
+                          input_h, input_w, input_ch,
+                          output_h, output_w, output_ch,
+                          filter_h, filter_w,
+                          params->stride_height, params->stride_width,
+                          data->padding.height, data->padding.width,
+                          data->input_offset,
+                          data->per_channel_multiplier,
+                          data->per_channel_shift,
+                          data->output_offset,
+                          data->activation_min, data->activation_max);
   } else {
-    // ── Fallback: call s4 wrapper directly on packed INT4 weights ──
-
+    // ── Fallback: s4 wrapper for layers with input_ch not multiple of 4 ──
     cmsis_nn_context ctx;
     if (data->scratch_buf_index_s4 >= 0) {
       ctx.buf =
@@ -432,7 +611,6 @@ TfLiteStatus PreunpackConvEval(TfLiteContext* context, TfLiteNode* node) {
       ctx.buf = nullptr;
     }
     ctx.size = 0;
-
     arm_convolve_wrapper_s4(&ctx, &conv_params, &quant_params,
                             &in_dims, input_data,
                             &filt_dims, filter_data,
