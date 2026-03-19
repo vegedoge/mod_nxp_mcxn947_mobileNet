@@ -45,6 +45,7 @@
 // 0 -> 4-pixel batch: unpack weights once, reuse across 4 pixels (default, best for INT4)
 // 1 -> 2OC×2pixel batch: unpack 2 OC weights, reuse activations across 2 OCs
 // 2 -> 2OC×4pixel batch: maximum batching, 8 accumulators (register spill expected)
+// 3 -> 2-pixel batch: for ablation comparison with 4-pixel batch
 #define FUSED_BATCH_MODE 0
 
 #endif // _DEMO_CONFIG_H_

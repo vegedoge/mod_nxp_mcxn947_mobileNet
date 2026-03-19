@@ -177,13 +177,36 @@ static void conv_1x1_fused_s4(
   __ASM volatile("pkhbt %0, %1, %1, lsl #16"
                   : "=r"(offset_i16x2) : "r"((int32_t)i16_offset));
 
-  // ── Main loop: 4 pixels at a time ──
-  // Weight unpack shared across 4 pixels: 7 insns (LDRH + SBFX×4 + PKHBT×2)
+  // ── Main loop: N pixels at a time (N=4 default, N=2 for FUSED_BATCH_MODE=3) ──
+  // Weight unpack shared across N pixels: 7 insns (LDRH + SBFX×4 + PKHBT×2)
   // Per pixel: LDR + SXTAB16×2 + SMLAD×2 = 5 insns
-  // Total: 7 + 5×4 = 27 insns / 16 MACs = 1.69 cyc/MAC
-  // Note: 8-weight unrolling tested but showed no improvement (LDR=LDRH=1 cycle,
-  //        extra >>16 shift + larger loop body offset any gains).
+  // 4px: 7 + 5×4 = 27 insns / 16 MACs = 1.69 cyc/MAC
+  // 2px: 7 + 5×2 = 17 insns /  8 MACs = 2.13 cyc/MAC
   int px = 0;
+#if FUSED_BATCH_MODE == 3
+  // ── 2-pixel batch mode (for ablation comparison) ──
+  for (; px + 1 < num_pixels; px += 2) {
+    const int8_t* a0 = input + px * c_in;
+    const int8_t* a1 = a0 + c_in;
+
+    for (int oc = 0; oc < c_out; oc++) {
+      const int32_t b = bias ? bias[oc] : 0;
+      int32_t acc0 = b, acc1 = b;
+      const int8_t* w_ptr = w_base + oc * c_in_packed;
+
+      for (int j = 0; j < c_in; j += 4) {
+        uint32_t in16;
+        __ASM volatile("ldrh %0, [%1]" : "=r"(in16) : "r"(w_ptr));
+        w_ptr += 2;
+
+        uint32_t wp02, wp13;
+        UNPACK4_AND_PACK(in16, wp02, wp13);
+
+        FUSED_MAC_ONE_PIXEL(a0, j, offset_i16x2, wp02, wp13, acc0);
+        FUSED_MAC_ONE_PIXEL(a1, j, offset_i16x2, wp02, wp13, acc1);
+      }
+#else
+  // ── 4-pixel batch mode (default, optimal) ──
   for (; px + 3 < num_pixels; px += 4) {
     const int8_t* a0 = input + px * c_in;
     const int8_t* a1 = a0 + c_in;
@@ -196,7 +219,6 @@ static void conv_1x1_fused_s4(
       const int8_t* w_ptr = w_base + oc * c_in_packed;
 
       for (int j = 0; j < c_in; j += 4) {
-        // ── Unpack 4 INT4 weights (shared across 4 pixels) ──
         uint32_t in16;
         __ASM volatile("ldrh %0, [%1]" : "=r"(in16) : "r"(w_ptr));
         w_ptr += 2;
@@ -204,17 +226,19 @@ static void conv_1x1_fused_s4(
         uint32_t wp02, wp13;
         UNPACK4_AND_PACK(in16, wp02, wp13);
 
-        // ── MAC all 4 pixels (reuse wp02, wp13) ──
         FUSED_MAC_ONE_PIXEL(a0, j, offset_i16x2, wp02, wp13, acc0);
         FUSED_MAC_ONE_PIXEL(a1, j, offset_i16x2, wp02, wp13, acc1);
         FUSED_MAC_ONE_PIXEL(a2, j, offset_i16x2, wp02, wp13, acc2);
         FUSED_MAC_ONE_PIXEL(a3, j, offset_i16x2, wp02, wp13, acc3);
       }
+#endif
 
       REQUANT_STORE(acc0, oc, px,   multiplier, shift, output_offset, act_min, act_max, output, c_out);
       REQUANT_STORE(acc1, oc, px+1, multiplier, shift, output_offset, act_min, act_max, output, c_out);
+#if FUSED_BATCH_MODE != 3
       REQUANT_STORE(acc2, oc, px+2, multiplier, shift, output_offset, act_min, act_max, output, c_out);
       REQUANT_STORE(acc3, oc, px+3, multiplier, shift, output_offset, act_min, act_max, output, c_out);
+#endif
     }
   }
 
