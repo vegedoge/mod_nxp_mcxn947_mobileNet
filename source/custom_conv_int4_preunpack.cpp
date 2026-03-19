@@ -95,16 +95,45 @@ static void unpack_int4_to_int8(const int8_t* packed, int8_t* unpacked,
   }
 }
 
-// ── Fused INT4 1×1 Conv2D (optimized) ──
+// ── Fused INT4 1×1 Conv2D (optimized, 4-pixel batch) ──
 // Reads INT4 weights directly from Flash, unpacks in registers, uses SMLAD.
 // No SRAM scratch buffer needed — works for arbitrarily large layers.
 // Only valid for 1×1 convolutions (no padding, no im2col).
 //
-// Optimizations (matching CMSIS-NN s4 DSP techniques):
+// Optimizations:
 //   - SXTAB16 for fused sign-extend + offset addition (1 insn vs 4 ADDs)
-//   - read_and_pad_s4 style nibble extraction
-//   - 2-pixel batching to amortize weight loads
-//   - 2×2 block: 2 pixels × 1 output channel with weight reuse
+//   - SBFX for signed 4-bit extraction (1 insn vs shift+mask+branch)
+//   - 4-pixel batching: unpack weights once, reuse across 4 spatial positions
+//     Theory: (7 shared + 5×4 per-px) = 27 insns / 16 MACs = 1.69 cyc/MAC
+//
+// Inner loop macro: unpack weights, then MAC one pixel.
+// Weights (wp02, wp13) must already be in registers.
+#define FUSED_MAC_ONE_PIXEL(a_ptr, j, offset, wp02, wp13, acc)  \
+  do {                                                           \
+    uint32_t _raw = *reinterpret_cast<const uint32_t*>((a_ptr) + (j)); \
+    uint32_t _lo, _hi;                                           \
+    __ASM volatile("sxtab16 %0, %1, %2"                          \
+                    : "=r"(_lo) : "r"(offset), "r"(_raw));       \
+    __ASM volatile("sxtab16 %0, %1, %2, ror #8"                  \
+                    : "=r"(_hi) : "r"(offset), "r"(_raw));       \
+    __ASM volatile("smlad %0, %1, %2, %0"                        \
+                    : "+r"(acc) : "r"(wp02), "r"(_lo));           \
+    __ASM volatile("smlad %0, %1, %2, %0"                        \
+                    : "+r"(acc) : "r"(wp13), "r"(_hi));           \
+  } while (0)
+
+// Requantize + clamp + store macro
+#define REQUANT_STORE(acc, oc, px, multiplier, shift, output_offset, \
+                      act_min, act_max, output, c_out)               \
+  do {                                                                \
+    int32_t _a = arm_nn_requantize((acc), (multiplier)[(oc)],         \
+                                   (shift)[(oc)]);                    \
+    _a += (output_offset);                                            \
+    _a = MAX(_a, (act_min));                                          \
+    _a = MIN(_a, (act_max));                                          \
+    (output)[(px) * (c_out) + (oc)] = static_cast<int8_t>(_a);       \
+  } while (0)
+
 __attribute__((optimize("O2")))
 static void conv_1x1_fused_s4(
     const int8_t* input,        // [H*W, C_in] INT8
@@ -129,84 +158,56 @@ static void conv_1x1_fused_s4(
   __ASM volatile("pkhbt %0, %1, %1, lsl #16"
                   : "=r"(offset_i16x2) : "r"((int32_t)i16_offset));
 
-  // Process 2 pixels at a time for weight reuse
+  // ── Main loop: 4 pixels at a time ──
+  // Weight unpack shared across 4 pixels: 7 insns
+  // Per pixel: LDR + SXTAB16×2 + SMLAD×2 = 5 insns
+  // Total: 7 + 5×4 = 27 insns / 16 MACs = 1.69 cyc/MAC
   int px = 0;
-  for (; px + 1 < num_pixels; px += 2) {
-    const int8_t* a_row0 = input + px * c_in;
-    const int8_t* a_row1 = input + (px + 1) * c_in;
+  for (; px + 3 < num_pixels; px += 4) {
+    const int8_t* a0 = input + px * c_in;
+    const int8_t* a1 = a0 + c_in;
+    const int8_t* a2 = a1 + c_in;
+    const int8_t* a3 = a2 + c_in;
 
     for (int oc = 0; oc < c_out; oc++) {
-      int32_t acc0 = bias ? bias[oc] : 0;  // pixel 0
-      int32_t acc1 = acc0;                   // pixel 1 (same bias)
+      const int32_t b = bias ? bias[oc] : 0;
+      int32_t acc0 = b, acc1 = b, acc2 = b, acc3 = b;
       const int8_t* w_ptr = w_base + oc * c_in_packed;
 
-      // Inner loop: 4 weights per iteration
       for (int j = 0; j < c_in; j += 4) {
-        // ── Unpack 4 INT4 weights using SBFX ──
+        // ── Unpack 4 INT4 weights (shared across 4 pixels) ──
         uint32_t in16;
         __ASM volatile("ldrh %0, [%1]" : "=r"(in16) : "r"(w_ptr));
         w_ptr += 2;
 
-        int32_t w0, w1, w2, w3;
-        __ASM volatile("sbfx %0, %1, #0, #4"  : "=r"(w0) : "r"(in16));
-        __ASM volatile("sbfx %0, %1, #4, #4"  : "=r"(w1) : "r"(in16));
-        __ASM volatile("sbfx %0, %1, #8, #4"  : "=r"(w2) : "r"(in16));
-        __ASM volatile("sbfx %0, %1, #12, #4" : "=r"(w3) : "r"(in16));
+        int32_t ww0, ww1, ww2, ww3;
+        __ASM volatile("sbfx %0, %1, #0, #4"  : "=r"(ww0) : "r"(in16));
+        __ASM volatile("sbfx %0, %1, #4, #4"  : "=r"(ww1) : "r"(in16));
+        __ASM volatile("sbfx %0, %1, #8, #4"  : "=r"(ww2) : "r"(in16));
+        __ASM volatile("sbfx %0, %1, #12, #4" : "=r"(ww3) : "r"(in16));
 
-        // Pack weights for SMLAD: {w2, w0} and {w3, w1}
         uint32_t wp02, wp13;
         __ASM volatile("pkhbt %0, %1, %2, lsl #16"
-                        : "=r"(wp02) : "r"(w0), "r"(w2));
+                        : "=r"(wp02) : "r"(ww0), "r"(ww2));
         __ASM volatile("pkhbt %0, %1, %2, lsl #16"
-                        : "=r"(wp13) : "r"(w1), "r"(w3));
+                        : "=r"(wp13) : "r"(ww1), "r"(ww3));
 
-        // ── Load activations for pixel 0 with SXTAB16 (fused extend + offset) ──
-        uint32_t lhs_raw0 = *reinterpret_cast<const uint32_t*>(a_row0 + j);
-        uint32_t lhs_low0, lhs_high0;
-        __ASM volatile("sxtab16 %0, %1, %2"
-                        : "=r"(lhs_low0) : "r"(offset_i16x2), "r"(lhs_raw0));
-        __ASM volatile("sxtab16 %0, %1, %2, ror #8"
-                        : "=r"(lhs_high0) : "r"(offset_i16x2), "r"(lhs_raw0));
-
-        // MAC for pixel 0: acc0 += w0*a0 + w2*a2, then w1*a1 + w3*a3
-        __ASM volatile("smlad %0, %1, %2, %0"
-                        : "+r"(acc0) : "r"(wp02), "r"(lhs_low0));
-        __ASM volatile("smlad %0, %1, %2, %0"
-                        : "+r"(acc0) : "r"(wp13), "r"(lhs_high0));
-
-        // ── Load activations for pixel 1 (reuse weights) ──
-        uint32_t lhs_raw1 = *reinterpret_cast<const uint32_t*>(a_row1 + j);
-        uint32_t lhs_low1, lhs_high1;
-        __ASM volatile("sxtab16 %0, %1, %2"
-                        : "=r"(lhs_low1) : "r"(offset_i16x2), "r"(lhs_raw1));
-        __ASM volatile("sxtab16 %0, %1, %2, ror #8"
-                        : "=r"(lhs_high1) : "r"(offset_i16x2), "r"(lhs_raw1));
-
-        // MAC for pixel 1 (weights already unpacked!)
-        __ASM volatile("smlad %0, %1, %2, %0"
-                        : "+r"(acc1) : "r"(wp02), "r"(lhs_low1));
-        __ASM volatile("smlad %0, %1, %2, %0"
-                        : "+r"(acc1) : "r"(wp13), "r"(lhs_high1));
+        // ── MAC all 4 pixels (reuse wp02, wp13) ──
+        FUSED_MAC_ONE_PIXEL(a0, j, offset_i16x2, wp02, wp13, acc0);
+        FUSED_MAC_ONE_PIXEL(a1, j, offset_i16x2, wp02, wp13, acc1);
+        FUSED_MAC_ONE_PIXEL(a2, j, offset_i16x2, wp02, wp13, acc2);
+        FUSED_MAC_ONE_PIXEL(a3, j, offset_i16x2, wp02, wp13, acc3);
       }
 
-      // Requantize pixel 0
-      acc0 = arm_nn_requantize(acc0, multiplier[oc], shift[oc]);
-      acc0 += output_offset;
-      acc0 = MAX(acc0, act_min);
-      acc0 = MIN(acc0, act_max);
-      output[px * c_out + oc] = static_cast<int8_t>(acc0);
-
-      // Requantize pixel 1
-      acc1 = arm_nn_requantize(acc1, multiplier[oc], shift[oc]);
-      acc1 += output_offset;
-      acc1 = MAX(acc1, act_min);
-      acc1 = MIN(acc1, act_max);
-      output[(px + 1) * c_out + oc] = static_cast<int8_t>(acc1);
+      REQUANT_STORE(acc0, oc, px,   multiplier, shift, output_offset, act_min, act_max, output, c_out);
+      REQUANT_STORE(acc1, oc, px+1, multiplier, shift, output_offset, act_min, act_max, output, c_out);
+      REQUANT_STORE(acc2, oc, px+2, multiplier, shift, output_offset, act_min, act_max, output, c_out);
+      REQUANT_STORE(acc3, oc, px+3, multiplier, shift, output_offset, act_min, act_max, output, c_out);
     }
   }
 
-  // Handle last pixel if num_pixels is odd
-  if (px < num_pixels) {
+  // ── Tail: remaining 1-3 pixels ──
+  for (; px < num_pixels; px++) {
     const int8_t* a_row = input + px * c_in;
     for (int oc = 0; oc < c_out; oc++) {
       int32_t acc = bias ? bias[oc] : 0;
@@ -217,39 +218,28 @@ static void conv_1x1_fused_s4(
         __ASM volatile("ldrh %0, [%1]" : "=r"(in16) : "r"(w_ptr));
         w_ptr += 2;
 
-        int32_t w0, w1, w2, w3;
-        __ASM volatile("sbfx %0, %1, #0, #4"  : "=r"(w0) : "r"(in16));
-        __ASM volatile("sbfx %0, %1, #4, #4"  : "=r"(w1) : "r"(in16));
-        __ASM volatile("sbfx %0, %1, #8, #4"  : "=r"(w2) : "r"(in16));
-        __ASM volatile("sbfx %0, %1, #12, #4" : "=r"(w3) : "r"(in16));
+        int32_t ww0, ww1, ww2, ww3;
+        __ASM volatile("sbfx %0, %1, #0, #4"  : "=r"(ww0) : "r"(in16));
+        __ASM volatile("sbfx %0, %1, #4, #4"  : "=r"(ww1) : "r"(in16));
+        __ASM volatile("sbfx %0, %1, #8, #4"  : "=r"(ww2) : "r"(in16));
+        __ASM volatile("sbfx %0, %1, #12, #4" : "=r"(ww3) : "r"(in16));
 
         uint32_t wp02, wp13;
         __ASM volatile("pkhbt %0, %1, %2, lsl #16"
-                        : "=r"(wp02) : "r"(w0), "r"(w2));
+                        : "=r"(wp02) : "r"(ww0), "r"(ww2));
         __ASM volatile("pkhbt %0, %1, %2, lsl #16"
-                        : "=r"(wp13) : "r"(w1), "r"(w3));
+                        : "=r"(wp13) : "r"(ww1), "r"(ww3));
 
-        uint32_t lhs_raw = *reinterpret_cast<const uint32_t*>(a_row + j);
-        uint32_t lhs_low, lhs_high;
-        __ASM volatile("sxtab16 %0, %1, %2"
-                        : "=r"(lhs_low) : "r"(offset_i16x2), "r"(lhs_raw));
-        __ASM volatile("sxtab16 %0, %1, %2, ror #8"
-                        : "=r"(lhs_high) : "r"(offset_i16x2), "r"(lhs_raw));
-
-        __ASM volatile("smlad %0, %1, %2, %0"
-                        : "+r"(acc) : "r"(wp02), "r"(lhs_low));
-        __ASM volatile("smlad %0, %1, %2, %0"
-                        : "+r"(acc) : "r"(wp13), "r"(lhs_high));
+        FUSED_MAC_ONE_PIXEL(a_row, j, offset_i16x2, wp02, wp13, acc);
       }
 
-      acc = arm_nn_requantize(acc, multiplier[oc], shift[oc]);
-      acc += output_offset;
-      acc = MAX(acc, act_min);
-      acc = MIN(acc, act_max);
-      output[px * c_out + oc] = static_cast<int8_t>(acc);
+      REQUANT_STORE(acc, oc, px, multiplier, shift, output_offset, act_min, act_max, output, c_out);
     }
   }
 }
+
+#undef FUSED_MAC_ONE_PIXEL
+#undef REQUANT_STORE
 
 // ── Fused INT4 general Conv2D (for 3×3 etc.) ──
 // Direct convolution: no im2col, no SRAM buffer.
