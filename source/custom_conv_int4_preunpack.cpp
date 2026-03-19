@@ -392,7 +392,133 @@ static void conv_1x1_fused_s4_2oc2px(
     }
   }
 }
-#endif  // FUSED_BATCH_MODE == 1
+#elif FUSED_BATCH_MODE == 2
+// ── Fused INT4 1×1 Conv2D (2OC × 4pixel batch) ──
+// Maximum batching: 2 output channels × 4 pixels = 8 accumulators.
+// Exceeds register file (14 GPRs) — compiler must spill to stack.
+// Theory without spill: (7×2 + 3×4 + 2×8) = 42 insns / 32 MACs = 1.31 cyc/MAC
+// Expected: spill overhead will negate the theoretical advantage.
+// Purpose: ablation study to show register pressure limits on Cortex-M33.
+__attribute__((optimize("O2")))
+static void conv_1x1_fused_s4_2oc4px(
+    const int8_t* input,
+    const int8_t* packed_w,
+    const int32_t* bias,
+    int8_t* output,
+    int num_pixels, int c_in, int c_out,
+    int32_t input_offset,
+    const int32_t* multiplier, const int32_t* shift,
+    int32_t output_offset, int32_t act_min, int32_t act_max) {
+  const int c_in_packed = c_in / 2;
+
+  const int16_t i16_offset = static_cast<int16_t>(input_offset);
+  uint32_t offset_i16x2;
+  __ASM volatile("pkhbt %0, %1, %1, lsl #16"
+                  : "=r"(offset_i16x2) : "r"((int32_t)i16_offset));
+
+  int px = 0;
+  for (; px + 3 < num_pixels; px += 4) {
+    const int8_t* a0 = input + px * c_in;
+    const int8_t* a1 = a0 + c_in;
+    const int8_t* a2 = a1 + c_in;
+    const int8_t* a3 = a2 + c_in;
+
+    int oc = 0;
+    for (; oc + 1 < c_out; oc += 2) {
+      const int32_t b0 = bias ? bias[oc] : 0;
+      const int32_t b1 = bias ? bias[oc + 1] : 0;
+      // 8 accumulators — will spill to stack
+      int32_t acc[8] = {b0, b1, b0, b1, b0, b1, b0, b1};
+      // acc[0]=px0_oc0, acc[1]=px0_oc1, acc[2]=px1_oc0, acc[3]=px1_oc1
+      // acc[4]=px2_oc0, acc[5]=px2_oc1, acc[6]=px3_oc0, acc[7]=px3_oc1
+
+      const int8_t* w_ptr_oc0 = packed_w + oc * c_in_packed;
+      const int8_t* w_ptr_oc1 = packed_w + (oc + 1) * c_in_packed;
+
+      for (int j = 0; j < c_in; j += 4) {
+        // Unpack both OCs
+        uint32_t in16_0, in16_1;
+        __ASM volatile("ldrh %0, [%1]" : "=r"(in16_0) : "r"(w_ptr_oc0));
+        w_ptr_oc0 += 2;
+        __ASM volatile("ldrh %0, [%1]" : "=r"(in16_1) : "r"(w_ptr_oc1));
+        w_ptr_oc1 += 2;
+
+        uint32_t wp02_0, wp13_0, wp02_1, wp13_1;
+        UNPACK4_AND_PACK(in16_0, wp02_0, wp13_0);
+        UNPACK4_AND_PACK(in16_1, wp02_1, wp13_1);
+
+        // Pixel 0
+        FUSED_MAC_ONE_PIXEL(a0, j, offset_i16x2, wp02_0, wp13_0, acc[0]);
+        FUSED_MAC_ONE_PIXEL(a0, j, offset_i16x2, wp02_1, wp13_1, acc[1]);
+        // Pixel 1
+        FUSED_MAC_ONE_PIXEL(a1, j, offset_i16x2, wp02_0, wp13_0, acc[2]);
+        FUSED_MAC_ONE_PIXEL(a1, j, offset_i16x2, wp02_1, wp13_1, acc[3]);
+        // Pixel 2
+        FUSED_MAC_ONE_PIXEL(a2, j, offset_i16x2, wp02_0, wp13_0, acc[4]);
+        FUSED_MAC_ONE_PIXEL(a2, j, offset_i16x2, wp02_1, wp13_1, acc[5]);
+        // Pixel 3
+        FUSED_MAC_ONE_PIXEL(a3, j, offset_i16x2, wp02_0, wp13_0, acc[6]);
+        FUSED_MAC_ONE_PIXEL(a3, j, offset_i16x2, wp02_1, wp13_1, acc[7]);
+      }
+
+      // Requantize all 8 outputs
+      for (int p = 0; p < 4; p++) {
+        for (int o = 0; o < 2; o++) {
+          int32_t a = acc[p * 2 + o];
+          a = arm_nn_requantize(a, multiplier[oc + o], shift[oc + o]);
+          a += output_offset;
+          a = MAX(a, act_min);
+          a = MIN(a, act_max);
+          output[(px + p) * c_out + oc + o] = static_cast<int8_t>(a);
+        }
+      }
+    }
+
+    // Odd OC tail
+    if (oc < c_out) {
+      int32_t a0v = bias ? bias[oc] : 0, a1v = a0v, a2v = a0v, a3v = a0v;
+      const int8_t* w_ptr = packed_w + oc * c_in_packed;
+      for (int j = 0; j < c_in; j += 4) {
+        uint32_t in16;
+        __ASM volatile("ldrh %0, [%1]" : "=r"(in16) : "r"(w_ptr));
+        w_ptr += 2;
+        uint32_t wp02, wp13;
+        UNPACK4_AND_PACK(in16, wp02, wp13);
+        FUSED_MAC_ONE_PIXEL(a0, j, offset_i16x2, wp02, wp13, a0v);
+        FUSED_MAC_ONE_PIXEL(a1, j, offset_i16x2, wp02, wp13, a1v);
+        FUSED_MAC_ONE_PIXEL(a2, j, offset_i16x2, wp02, wp13, a2v);
+        FUSED_MAC_ONE_PIXEL(a3, j, offset_i16x2, wp02, wp13, a3v);
+      }
+      int32_t* accs[] = {&a0v, &a1v, &a2v, &a3v};
+      for (int p = 0; p < 4; p++) {
+        int32_t v = arm_nn_requantize(*accs[p], multiplier[oc], shift[oc]);
+        v += output_offset;
+        output[(px + p) * c_out + oc] = static_cast<int8_t>(MAX(MIN(v, act_max), act_min));
+      }
+    }
+  }
+
+  // Remaining 1-3 pixels: fall back to single-pixel
+  for (; px < num_pixels; px++) {
+    const int8_t* a_row = input + px * c_in;
+    for (int oc = 0; oc < c_out; oc++) {
+      int32_t acc = bias ? bias[oc] : 0;
+      const int8_t* w_ptr = packed_w + oc * c_in_packed;
+      for (int j = 0; j < c_in; j += 4) {
+        uint32_t in16;
+        __ASM volatile("ldrh %0, [%1]" : "=r"(in16) : "r"(w_ptr));
+        w_ptr += 2;
+        uint32_t wp02, wp13;
+        UNPACK4_AND_PACK(in16, wp02, wp13);
+        FUSED_MAC_ONE_PIXEL(a_row, j, offset_i16x2, wp02, wp13, acc);
+      }
+      acc = arm_nn_requantize(acc, multiplier[oc], shift[oc]);
+      acc += output_offset;
+      output[px * c_out + oc] = static_cast<int8_t>(MAX(MIN(acc, act_max), act_min));
+    }
+  }
+}
+#endif  // FUSED_BATCH_MODE
 
 #undef FUSED_MAC_ONE_PIXEL
 #undef UNPACK4_AND_PACK
@@ -725,7 +851,9 @@ TfLiteStatus PreunpackConvEval(TfLiteContext* context, TfLiteNode* node) {
   } else if (data->is_1x1) {
     // ── Fused path: INT4 unpack in registers + SMLAD, no SRAM buffer ──
     // For 1×1 convolutions that don't fit in pre-unpack scratch.
-#if FUSED_BATCH_MODE == 1
+#if FUSED_BATCH_MODE == 2
+    conv_1x1_fused_s4_2oc4px(
+#elif FUSED_BATCH_MODE == 1
     conv_1x1_fused_s4_2oc2px(
 #else
     conv_1x1_fused_s4(
