@@ -106,8 +106,7 @@ static void unpack_int4_to_int8(const int8_t* packed, int8_t* unpacked,
 //   - 4-pixel batching: unpack weights once, reuse across 4 spatial positions
 //     Theory: (7 shared + 5×4 per-px) = 27 insns / 16 MACs = 1.69 cyc/MAC
 //
-// Inner loop macro: unpack weights, then MAC one pixel.
-// Weights (wp02, wp13) must already be in registers.
+// Inner loop macro: load 4 activations, apply offset, MAC with pre-packed weights.
 #define FUSED_MAC_ONE_PIXEL(a_ptr, j, offset, wp02, wp13, acc)  \
   do {                                                           \
     uint32_t _raw = *reinterpret_cast<const uint32_t*>((a_ptr) + (j)); \
@@ -120,6 +119,21 @@ static void unpack_int4_to_int8(const int8_t* packed, int8_t* unpacked,
                     : "+r"(acc) : "r"(wp02), "r"(_lo));           \
     __ASM volatile("smlad %0, %1, %2, %0"                        \
                     : "+r"(acc) : "r"(wp13), "r"(_hi));           \
+  } while (0)
+
+// Unpack 4 INT4 weights from lower/upper 16 bits of a 32-bit word,
+// pack into SMLAD-ready format.
+#define UNPACK4_AND_PACK(bits, wp02, wp13)                       \
+  do {                                                           \
+    int32_t _w0, _w1, _w2, _w3;                                  \
+    __ASM volatile("sbfx %0, %1, #0, #4"  : "=r"(_w0) : "r"(bits)); \
+    __ASM volatile("sbfx %0, %1, #4, #4"  : "=r"(_w1) : "r"(bits)); \
+    __ASM volatile("sbfx %0, %1, #8, #4"  : "=r"(_w2) : "r"(bits)); \
+    __ASM volatile("sbfx %0, %1, #12, #4" : "=r"(_w3) : "r"(bits)); \
+    __ASM volatile("pkhbt %0, %1, %2, lsl #16"                   \
+                    : "=r"(wp02) : "r"(_w0), "r"(_w2));          \
+    __ASM volatile("pkhbt %0, %1, %2, lsl #16"                   \
+                    : "=r"(wp13) : "r"(_w1), "r"(_w3));          \
   } while (0)
 
 // Requantize + clamp + store macro
@@ -159,9 +173,11 @@ static void conv_1x1_fused_s4(
                   : "=r"(offset_i16x2) : "r"((int32_t)i16_offset));
 
   // ── Main loop: 4 pixels at a time ──
-  // Weight unpack shared across 4 pixels: 7 insns
+  // Weight unpack shared across 4 pixels: 7 insns (LDRH + SBFX×4 + PKHBT×2)
   // Per pixel: LDR + SXTAB16×2 + SMLAD×2 = 5 insns
   // Total: 7 + 5×4 = 27 insns / 16 MACs = 1.69 cyc/MAC
+  // Note: 8-weight unrolling tested but showed no improvement (LDR=LDRH=1 cycle,
+  //        extra >>16 shift + larger loop body offset any gains).
   int px = 0;
   for (; px + 3 < num_pixels; px += 4) {
     const int8_t* a0 = input + px * c_in;
@@ -180,17 +196,8 @@ static void conv_1x1_fused_s4(
         __ASM volatile("ldrh %0, [%1]" : "=r"(in16) : "r"(w_ptr));
         w_ptr += 2;
 
-        int32_t ww0, ww1, ww2, ww3;
-        __ASM volatile("sbfx %0, %1, #0, #4"  : "=r"(ww0) : "r"(in16));
-        __ASM volatile("sbfx %0, %1, #4, #4"  : "=r"(ww1) : "r"(in16));
-        __ASM volatile("sbfx %0, %1, #8, #4"  : "=r"(ww2) : "r"(in16));
-        __ASM volatile("sbfx %0, %1, #12, #4" : "=r"(ww3) : "r"(in16));
-
         uint32_t wp02, wp13;
-        __ASM volatile("pkhbt %0, %1, %2, lsl #16"
-                        : "=r"(wp02) : "r"(ww0), "r"(ww2));
-        __ASM volatile("pkhbt %0, %1, %2, lsl #16"
-                        : "=r"(wp13) : "r"(ww1), "r"(ww3));
+        UNPACK4_AND_PACK(in16, wp02, wp13);
 
         // ── MAC all 4 pixels (reuse wp02, wp13) ──
         FUSED_MAC_ONE_PIXEL(a0, j, offset_i16x2, wp02, wp13, acc0);
@@ -218,18 +225,8 @@ static void conv_1x1_fused_s4(
         __ASM volatile("ldrh %0, [%1]" : "=r"(in16) : "r"(w_ptr));
         w_ptr += 2;
 
-        int32_t ww0, ww1, ww2, ww3;
-        __ASM volatile("sbfx %0, %1, #0, #4"  : "=r"(ww0) : "r"(in16));
-        __ASM volatile("sbfx %0, %1, #4, #4"  : "=r"(ww1) : "r"(in16));
-        __ASM volatile("sbfx %0, %1, #8, #4"  : "=r"(ww2) : "r"(in16));
-        __ASM volatile("sbfx %0, %1, #12, #4" : "=r"(ww3) : "r"(in16));
-
         uint32_t wp02, wp13;
-        __ASM volatile("pkhbt %0, %1, %2, lsl #16"
-                        : "=r"(wp02) : "r"(ww0), "r"(ww2));
-        __ASM volatile("pkhbt %0, %1, %2, lsl #16"
-                        : "=r"(wp13) : "r"(ww1), "r"(ww3));
-
+        UNPACK4_AND_PACK(in16, wp02, wp13);
         FUSED_MAC_ONE_PIXEL(a_row, j, offset_i16x2, wp02, wp13, acc);
       }
 
@@ -238,7 +235,167 @@ static void conv_1x1_fused_s4(
   }
 }
 
+#if FUSED_BATCH_MODE == 1
+// ── Fused INT4 1×1 Conv2D (2OC × 2pixel batch) ──
+// Alternative batching strategy: process 2 output channels × 2 pixels simultaneously.
+// Shares activation loading across 2 OCs (saves 3 insns per shared pixel).
+// Theory: (7×2 weight_unpack + 3×2 act_load + 2×4 SMLAD) = 28 insns / 16 MACs = 1.75 cyc/MAC
+// Compared to 4px batch: 27 insns / 16 MACs = 1.69 cyc/MAC (slightly worse).
+// Purpose: ablation study to validate that pixel-batching > OC-batching for INT4 on Cortex-M33.
+__attribute__((optimize("O2")))
+static void conv_1x1_fused_s4_2oc2px(
+    const int8_t* input,
+    const int8_t* packed_w,
+    const int32_t* bias,
+    int8_t* output,
+    int num_pixels, int c_in, int c_out,
+    int32_t input_offset,
+    const int32_t* multiplier, const int32_t* shift,
+    int32_t output_offset, int32_t act_min, int32_t act_max) {
+  const int c_in_packed = c_in / 2;
+
+  const int16_t i16_offset = static_cast<int16_t>(input_offset);
+  uint32_t offset_i16x2;
+  __ASM volatile("pkhbt %0, %1, %1, lsl #16"
+                  : "=r"(offset_i16x2) : "r"((int32_t)i16_offset));
+
+  // ── Main loop: 2 pixels × 2 output channels ──
+  int px = 0;
+  for (; px + 1 < num_pixels; px += 2) {
+    const int8_t* a0 = input + px * c_in;
+    const int8_t* a1 = a0 + c_in;
+
+    int oc = 0;
+    for (; oc + 1 < c_out; oc += 2) {
+      const int32_t b0 = bias ? bias[oc] : 0;
+      const int32_t b1 = bias ? bias[oc + 1] : 0;
+      int32_t acc_p0o0 = b0;  // pixel 0, oc 0
+      int32_t acc_p0o1 = b1;  // pixel 0, oc 1
+      int32_t acc_p1o0 = b0;  // pixel 1, oc 0
+      int32_t acc_p1o1 = b1;  // pixel 1, oc 1
+
+      const int8_t* w_ptr_oc0 = packed_w + oc * c_in_packed;
+      const int8_t* w_ptr_oc1 = packed_w + (oc + 1) * c_in_packed;
+
+      for (int j = 0; j < c_in; j += 4) {
+        // ── Unpack weights for OC 0 ──
+        uint32_t in16_oc0;
+        __ASM volatile("ldrh %0, [%1]" : "=r"(in16_oc0) : "r"(w_ptr_oc0));
+        w_ptr_oc0 += 2;
+        uint32_t wp02_oc0, wp13_oc0;
+        UNPACK4_AND_PACK(in16_oc0, wp02_oc0, wp13_oc0);
+
+        // ── Unpack weights for OC 1 ──
+        uint32_t in16_oc1;
+        __ASM volatile("ldrh %0, [%1]" : "=r"(in16_oc1) : "r"(w_ptr_oc1));
+        w_ptr_oc1 += 2;
+        uint32_t wp02_oc1, wp13_oc1;
+        UNPACK4_AND_PACK(in16_oc1, wp02_oc1, wp13_oc1);
+
+        // ── Pixel 0: load activation once, MAC with both OCs ──
+        uint32_t raw0 = *reinterpret_cast<const uint32_t*>(a0 + j);
+        uint32_t lo0, hi0;
+        __ASM volatile("sxtab16 %0, %1, %2"
+                        : "=r"(lo0) : "r"(offset_i16x2), "r"(raw0));
+        __ASM volatile("sxtab16 %0, %1, %2, ror #8"
+                        : "=r"(hi0) : "r"(offset_i16x2), "r"(raw0));
+
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc_p0o0) : "r"(wp02_oc0), "r"(lo0));
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc_p0o0) : "r"(wp13_oc0), "r"(hi0));
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc_p0o1) : "r"(wp02_oc1), "r"(lo0));
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc_p0o1) : "r"(wp13_oc1), "r"(hi0));
+
+        // ── Pixel 1: load activation once, MAC with both OCs ──
+        uint32_t raw1 = *reinterpret_cast<const uint32_t*>(a1 + j);
+        uint32_t lo1, hi1;
+        __ASM volatile("sxtab16 %0, %1, %2"
+                        : "=r"(lo1) : "r"(offset_i16x2), "r"(raw1));
+        __ASM volatile("sxtab16 %0, %1, %2, ror #8"
+                        : "=r"(hi1) : "r"(offset_i16x2), "r"(raw1));
+
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc_p1o0) : "r"(wp02_oc0), "r"(lo1));
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc_p1o0) : "r"(wp13_oc0), "r"(hi1));
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc_p1o1) : "r"(wp02_oc1), "r"(lo1));
+        __ASM volatile("smlad %0, %1, %2, %0"
+                        : "+r"(acc_p1o1) : "r"(wp13_oc1), "r"(hi1));
+      }
+
+      // Requantize all 4 outputs
+      acc_p0o0 = arm_nn_requantize(acc_p0o0, multiplier[oc], shift[oc]);
+      acc_p0o0 += output_offset;
+      output[px * c_out + oc] = static_cast<int8_t>(
+          MAX(MIN(acc_p0o0, act_max), act_min));
+
+      acc_p0o1 = arm_nn_requantize(acc_p0o1, multiplier[oc+1], shift[oc+1]);
+      acc_p0o1 += output_offset;
+      output[px * c_out + oc + 1] = static_cast<int8_t>(
+          MAX(MIN(acc_p0o1, act_max), act_min));
+
+      acc_p1o0 = arm_nn_requantize(acc_p1o0, multiplier[oc], shift[oc]);
+      acc_p1o0 += output_offset;
+      output[(px+1) * c_out + oc] = static_cast<int8_t>(
+          MAX(MIN(acc_p1o0, act_max), act_min));
+
+      acc_p1o1 = arm_nn_requantize(acc_p1o1, multiplier[oc+1], shift[oc+1]);
+      acc_p1o1 += output_offset;
+      output[(px+1) * c_out + oc + 1] = static_cast<int8_t>(
+          MAX(MIN(acc_p1o1, act_max), act_min));
+    }
+
+    // Handle odd output channel count
+    if (oc < c_out) {
+      int32_t acc0 = bias ? bias[oc] : 0;
+      int32_t acc1 = acc0;
+      const int8_t* w_ptr = packed_w + oc * c_in_packed;
+      for (int j = 0; j < c_in; j += 4) {
+        uint32_t in16;
+        __ASM volatile("ldrh %0, [%1]" : "=r"(in16) : "r"(w_ptr));
+        w_ptr += 2;
+        uint32_t wp02, wp13;
+        UNPACK4_AND_PACK(in16, wp02, wp13);
+        FUSED_MAC_ONE_PIXEL(a0, j, offset_i16x2, wp02, wp13, acc0);
+        FUSED_MAC_ONE_PIXEL(a1, j, offset_i16x2, wp02, wp13, acc1);
+      }
+      acc0 = arm_nn_requantize(acc0, multiplier[oc], shift[oc]);
+      acc0 += output_offset;
+      output[px * c_out + oc] = static_cast<int8_t>(MAX(MIN(acc0, act_max), act_min));
+      acc1 = arm_nn_requantize(acc1, multiplier[oc], shift[oc]);
+      acc1 += output_offset;
+      output[(px+1) * c_out + oc] = static_cast<int8_t>(MAX(MIN(acc1, act_max), act_min));
+    }
+  }
+
+  // Handle last pixel if odd
+  if (px < num_pixels) {
+    const int8_t* a_row = input + px * c_in;
+    for (int oc = 0; oc < c_out; oc++) {
+      int32_t acc = bias ? bias[oc] : 0;
+      const int8_t* w_ptr = packed_w + oc * c_in_packed;
+      for (int j = 0; j < c_in; j += 4) {
+        uint32_t in16;
+        __ASM volatile("ldrh %0, [%1]" : "=r"(in16) : "r"(w_ptr));
+        w_ptr += 2;
+        uint32_t wp02, wp13;
+        UNPACK4_AND_PACK(in16, wp02, wp13);
+        FUSED_MAC_ONE_PIXEL(a_row, j, offset_i16x2, wp02, wp13, acc);
+      }
+      acc = arm_nn_requantize(acc, multiplier[oc], shift[oc]);
+      acc += output_offset;
+      output[px * c_out + oc] = static_cast<int8_t>(MAX(MIN(acc, act_max), act_min));
+    }
+  }
+}
+#endif  // FUSED_BATCH_MODE == 1
+
 #undef FUSED_MAC_ONE_PIXEL
+#undef UNPACK4_AND_PACK
 #undef REQUANT_STORE
 
 // ── Fused INT4 general Conv2D (for 3×3 etc.) ──
@@ -568,8 +725,13 @@ TfLiteStatus PreunpackConvEval(TfLiteContext* context, TfLiteNode* node) {
   } else if (data->is_1x1) {
     // ── Fused path: INT4 unpack in registers + SMLAD, no SRAM buffer ──
     // For 1×1 convolutions that don't fit in pre-unpack scratch.
-    conv_1x1_fused_s4(input_data, filter_data, bias_data, output_data,
-                      output_h * output_w,  // num_pixels
+#if FUSED_BATCH_MODE == 1
+    conv_1x1_fused_s4_2oc2px(
+#else
+    conv_1x1_fused_s4(
+#endif
+                      input_data, filter_data, bias_data, output_data,
+                      output_h * output_w,
                       input_ch, output_ch,
                       data->input_offset,
                       data->per_channel_multiplier,
