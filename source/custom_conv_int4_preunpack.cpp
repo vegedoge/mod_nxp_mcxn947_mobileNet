@@ -30,6 +30,10 @@
 #include "arm_nnfunctions.h"
 #include "arm_nnsupportfunctions.h"
 
+// For profiling breakdown
+#include "timer.h"
+#include "fsl_debug_console.h"
+
 #include <string.h>
 
 namespace tflite {
@@ -71,6 +75,7 @@ struct PreunpackConvOpData {
 // Bulk unpack INT4 (packed 2-per-byte) → INT8
 // Matches GET_INT4_WEIGHT in custom_int4_unpack.h:
 //   even index = low nibble, odd index = high nibble
+
 static void unpack_int4_to_int8(const int8_t* packed, int8_t* unpacked,
                                 int num_elements) {
   const uint8_t* src = reinterpret_cast<const uint8_t*>(packed);
@@ -148,7 +153,7 @@ static void unpack_int4_to_int8(const int8_t* packed, int8_t* unpacked,
     (output)[(px) * (c_out) + (oc)] = static_cast<int8_t>(_a);       \
   } while (0)
 
-__attribute__((optimize("O2")))
+
 static void conv_1x1_fused_s4(
     const int8_t* input,        // [H*W, C_in] INT8
     const int8_t* packed_w,     // [C_out, C_in/2] INT4 packed
@@ -242,7 +247,7 @@ static void conv_1x1_fused_s4(
 // Theory: (7×2 weight_unpack + 3×2 act_load + 2×4 SMLAD) = 28 insns / 16 MACs = 1.75 cyc/MAC
 // Compared to 4px batch: 27 insns / 16 MACs = 1.69 cyc/MAC (slightly worse).
 // Purpose: ablation study to validate that pixel-batching > OC-batching for INT4 on Cortex-M33.
-__attribute__((optimize("O2")))
+
 static void conv_1x1_fused_s4_2oc2px(
     const int8_t* input,
     const int8_t* packed_w,
@@ -399,7 +404,7 @@ static void conv_1x1_fused_s4_2oc2px(
 // Theory without spill: (7×2 + 3×4 + 2×8) = 42 insns / 32 MACs = 1.31 cyc/MAC
 // Expected: spill overhead will negate the theoretical advantage.
 // Purpose: ablation study to show register pressure limits on Cortex-M33.
-__attribute__((optimize("O2")))
+
 static void conv_1x1_fused_s4_2oc4px(
     const int8_t* input,
     const int8_t* packed_w,
@@ -527,6 +532,7 @@ static void conv_1x1_fused_s4_2oc4px(
 // ── Fused INT4 general Conv2D (for 3×3 etc.) ──
 // Direct convolution: no im2col, no SRAM buffer.
 // Iterates over kernel spatial positions, reads INT4 weights from Flash.
+
 __attribute__((optimize("O2")))
 static void conv_general_fused_s4(
     const int8_t* input,        // [H_in, W_in, C_in]
@@ -827,12 +833,23 @@ TfLiteStatus PreunpackConvEval(TfLiteContext* context, TfLiteNode* node) {
   cmsis_nn_dims bias_dims = {1, 1, 1, output_ch};
   cmsis_nn_dims out_dims = {batches, output_h, output_w, output_ch};
 
+  // Profiling: log unpack vs kernel time on the 6th inference (serial ready)
+  static int s_eval_count = 0;
+  s_eval_count++;
+  // Inference 6 = sample index 5, logged by profiler. We log on inferences 85-98
+  // (= sample 6's 14 Conv2D layers, after serial is connected)
+  const bool do_profile = (s_eval_count >= 85 && s_eval_count <= 98);
+
   if (data->use_s8_fast) {
     // ── Fast path: unpack INT4 → INT8, then call s8 wrapper ──
+
+    auto t0 = TIMER_GetTimeInUS();
 
     // Bulk unpack into static SRAM buffer
     unpack_int4_to_int8(filter_data, s_preunpack_buf,
                         data->weight_bytes_int8);
+
+    auto t1 = TIMER_GetTimeInUS();
 
     // Setup context with scratch buffer for s8 kernel
     cmsis_nn_context ctx;
@@ -848,9 +865,19 @@ TfLiteStatus PreunpackConvEval(TfLiteContext* context, TfLiteNode* node) {
                             &filt_dims, s_preunpack_buf,
                             &bias_dims, bias_data,
                             &out_dims, output_data);
+
+    auto t2 = TIMER_GetTimeInUS();
+
+    if (do_profile) {
+      PRINTF("[PreUnpack] %dx%d c%d->%d  unpack=%dus  kernel=%dus  total=%dus  wt=%dB\r\n",
+             filter_h, filter_w, input_ch, output_ch,
+             (int)(t1-t0), (int)(t2-t1), (int)(t2-t0),
+             data->weight_bytes_int8);
+    }
   } else if (data->is_1x1) {
     // ── Fused path: INT4 unpack in registers + SMLAD, no SRAM buffer ──
-    // For 1×1 convolutions that don't fit in pre-unpack scratch.
+    auto tf0 = TIMER_GetTimeInUS();
+
 #if FUSED_BATCH_MODE == 2
     conv_1x1_fused_s4_2oc4px(
 #elif FUSED_BATCH_MODE == 1
@@ -866,6 +893,13 @@ TfLiteStatus PreunpackConvEval(TfLiteContext* context, TfLiteNode* node) {
                       data->per_channel_shift,
                       data->output_offset,
                       data->activation_min, data->activation_max);
+
+    auto tf1 = TIMER_GetTimeInUS();
+    if (do_profile) {
+      PRINTF("[Fused] %dx%d c%d->%d  kernel=%dus  wt=%dB\r\n",
+             filter_h, filter_w, input_ch, output_ch,
+             (int)(tf1-tf0), data->weight_bytes_int8);
+    }
   } else if (input_ch % 4 == 0) {
     // ── General fused path: direct conv with INT4 unpack + SMLAD ──
     // No SRAM buffer, no im2col. Works for any kernel size.
