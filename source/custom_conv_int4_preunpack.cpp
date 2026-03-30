@@ -62,7 +62,10 @@ struct PreunpackConvOpData {
   int scratch_buf_index;     // for s8 wrapper
   int scratch_buf_index_s4;  // for s4 fallback
 
-  // Whether this layer fits in the pre-unpack buffer
+  // Whether this layer's weights are INT4 (packed) or INT8 (native)
+  bool is_int4;
+
+  // Whether this layer fits in the pre-unpack buffer (INT4 only)
   bool use_s8_fast;
 
   // Whether this is a 1×1 convolution (eligible for fused SMLAD path)
@@ -746,13 +749,21 @@ TfLiteStatus PreunpackConvPrepare(TfLiteContext* context, TfLiteNode* node) {
     data->per_channel_shift[i] = static_cast<int32_t>(shift_tmp);
   }
 
-  // Determine if this layer fits in the pre-unpack buffer
-  data->weight_bytes_int8 = output_ch * filter_h * filter_w * input_ch;
-  data->use_s8_fast =
-      (data->weight_bytes_int8 <= PREUNPACK_SCRATCH_KB * 1024);
+  // Detect INT4 vs INT8 from tensor type (set by pack_mixed.py compact mode)
+  data->is_int4 = (filter->type == kTfLiteInt4);
 
-  // Check if eligible for fused SMLAD path (1×1 conv, no padding, stride 1)
-  data->is_1x1 = (filter_h == 1 && filter_w == 1 &&
+  // Determine if this layer fits in the pre-unpack buffer (INT4 only)
+  data->weight_bytes_int8 = output_ch * filter_h * filter_w * input_ch;
+  if (data->is_int4) {
+    data->use_s8_fast =
+        (data->weight_bytes_int8 <= PREUNPACK_SCRATCH_KB * 1024);
+  } else {
+    // INT8: always use s8 directly (no unpack needed)
+    data->use_s8_fast = true;
+  }
+
+  // Check if eligible for fused SMLAD path (INT4 1×1 conv only)
+  data->is_1x1 = (data->is_int4 && filter_h == 1 && filter_w == 1 &&
                    params->stride_height == 1 && params->stride_width == 1 &&
                    params->dilation_height_factor == 1 &&
                    params->dilation_width_factor == 1 &&
@@ -863,6 +874,24 @@ TfLiteStatus PreunpackConvEval(TfLiteContext* context, TfLiteNode* node) {
   // Inference 6 = sample index 5, logged by profiler. We log on inferences 85-98
   // (= sample 6's 14 Conv2D layers, after serial is connected)
   const bool do_profile = (s_eval_count >= 85 && s_eval_count <= 98);
+
+  if (!data->is_int4) {
+    // ── INT8 path: call s8 kernel directly, no unpacking needed ──
+    cmsis_nn_context ctx;
+    if (data->scratch_buf_index >= 0) {
+      ctx.buf = context->GetScratchBuffer(context, data->scratch_buf_index);
+    } else {
+      ctx.buf = nullptr;
+    }
+    ctx.size = 0;
+
+    arm_convolve_wrapper_s8(&ctx, &conv_params, &quant_params,
+                            &in_dims, input_data,
+                            &filt_dims, filter_data,
+                            &bias_dims, bias_data,
+                            &out_dims, output_data);
+    return kTfLiteOk;
+  }
 
   if (data->use_s8_fast) {
     // ── Fast path: unpack INT4 → INT8, then call s8 wrapper ──
