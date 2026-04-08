@@ -42,6 +42,12 @@ namespace {
 // Static scratch buffer for INT4→INT8 pre-unpack (lives in BSS/SRAM)
 static int8_t s_preunpack_buf[PREUNPACK_SCRATCH_KB * 1024];
 
+// Precision config: subgraph tensor indices that store INT2-packed weights.
+// Both INT4 and INT2 layers carry filter->type == kTfLiteInt4 (FlatBuffer schema
+// has no INT2 type), so we identify INT2 layers by their global tensor index.
+// Generated/maintained alongside the model header (see precision_config.h).
+#include "precision_config.h"
+
 struct PreunpackConvOpData {
   // Per-channel quantization
   int32_t* per_channel_multiplier;
@@ -62,8 +68,10 @@ struct PreunpackConvOpData {
   int scratch_buf_index;     // for s8 wrapper
   int scratch_buf_index_s4;  // for s4 fallback
 
-  // Whether this layer's weights are INT4 (packed) or INT8 (native)
+  // Precision flags. Both is_int4 and is_int2 may be set; is_int2 takes precedence.
+  // (INT2 weights are stored under TensorType.INT4 in the FlatBuffer.)
   bool is_int4;
+  bool is_int2;
 
   // Whether this layer fits in the pre-unpack buffer (INT4 only)
   bool use_s8_fast;
@@ -74,6 +82,15 @@ struct PreunpackConvOpData {
   // Number of INT8 weight bytes (C_out * KH * KW * C_in)
   int weight_bytes_int8;
 };
+
+// Linear scan against the INT2 tensor index list.
+// kInt2TensorIndices / kNumInt2Tensors come from precision_config.h.
+static inline bool IsInt2Tensor(int tensor_index) {
+  for (int i = 0; i < kNumInt2Tensors; ++i) {
+    if (kInt2TensorIndices[i] == tensor_index) return true;
+  }
+  return false;
+}
 
 // Bulk unpack INT4 (packed 2-per-byte) → INT8
 // Matches GET_INT4_WEIGHT in custom_int4_unpack.h:
@@ -100,6 +117,43 @@ static void unpack_int4_to_int8(const int8_t* packed, int8_t* unpacked,
     int8_t lo = static_cast<int8_t>((byte & 0x0F));
     if (lo & 0x08) lo |= 0xF0;
     unpacked[num_elements - 1] = lo;
+  }
+}
+
+// Bulk unpack INT2 (packed 4-per-byte) → INT8
+// Matches the layout produced by pack_mixed.py:quantize_and_pack_int2:
+//   byte = w0 | (w1 << 2) | (w2 << 4) | (w3 << 6)
+//   where each w_i is a 2-bit signed value with range [-2, 1].
+// Sign-extend bit 1 to fill bits 7..2 (so 0b10 -> -2, 0b11 -> -1).
+
+static void unpack_int2_to_int8(const int8_t* packed, int8_t* unpacked,
+                                int num_elements) {
+  const uint8_t* src = reinterpret_cast<const uint8_t*>(packed);
+  const int num_full_bytes = num_elements / 4;
+  for (int i = 0; i < num_full_bytes; i++) {
+    const uint8_t byte = src[i];
+    int8_t v0 = static_cast<int8_t>(byte & 0x03);
+    int8_t v1 = static_cast<int8_t>((byte >> 2) & 0x03);
+    int8_t v2 = static_cast<int8_t>((byte >> 4) & 0x03);
+    int8_t v3 = static_cast<int8_t>((byte >> 6) & 0x03);
+    if (v0 & 0x02) v0 |= 0xFC;
+    if (v1 & 0x02) v1 |= 0xFC;
+    if (v2 & 0x02) v2 |= 0xFC;
+    if (v3 & 0x02) v3 |= 0xFC;
+    unpacked[4 * i + 0] = v0;
+    unpacked[4 * i + 1] = v1;
+    unpacked[4 * i + 2] = v2;
+    unpacked[4 * i + 3] = v3;
+  }
+  // Handle trailing 1..3 elements (shouldn't happen for conv weights, but be safe)
+  const int rem = num_elements - num_full_bytes * 4;
+  if (rem > 0) {
+    const uint8_t byte = src[num_full_bytes];
+    for (int j = 0; j < rem; j++) {
+      int8_t v = static_cast<int8_t>((byte >> (j * 2)) & 0x03);
+      if (v & 0x02) v |= 0xFC;
+      unpacked[num_full_bytes * 4 + j] = v;
+    }
   }
 }
 
@@ -749,12 +803,16 @@ TfLiteStatus PreunpackConvPrepare(TfLiteContext* context, TfLiteNode* node) {
     data->per_channel_shift[i] = static_cast<int32_t>(shift_tmp);
   }
 
-  // Detect INT4 vs INT8 from tensor type (set by pack_mixed.py compact mode)
+  // Detect INT4 vs INT8 from tensor type (set by pack_mixed.py compact mode).
+  // INT2 layers also carry kTfLiteInt4 — disambiguate via the precision config table.
   data->is_int4 = (filter->type == kTfLiteInt4);
+  data->is_int2 = data->is_int4 && IsInt2Tensor(node->inputs->data[1]);
 
-  // Determine if this layer fits in the pre-unpack buffer (INT4 only)
+  // Determine if this layer fits in the pre-unpack buffer (INT4/INT2 only).
+  // weight_bytes_int8 = number of int8 weights produced by unpacking, identical
+  // for INT4 and INT2 since both decode to int8 in s_preunpack_buf.
   data->weight_bytes_int8 = output_ch * filter_h * filter_w * input_ch;
-  if (data->is_int4) {
+  if (data->is_int4 || data->is_int2) {
     data->use_s8_fast =
         (data->weight_bytes_int8 <= PREUNPACK_SCRATCH_KB * 1024);
   } else {
@@ -762,8 +820,11 @@ TfLiteStatus PreunpackConvPrepare(TfLiteContext* context, TfLiteNode* node) {
     data->use_s8_fast = true;
   }
 
-  // Check if eligible for fused SMLAD path (INT4 1×1 conv only)
-  data->is_1x1 = (data->is_int4 && filter_h == 1 && filter_w == 1 &&
+  // Check if eligible for fused SMLAD path (INT4 1×1 conv only — fused
+  // kernel uses SBFX to extract 4-bit nibbles, so INT2 layers must use the
+  // bulk-unpack fast path instead).
+  data->is_1x1 = (data->is_int4 && !data->is_int2 &&
+                   filter_h == 1 && filter_w == 1 &&
                    params->stride_height == 1 && params->stride_width == 1 &&
                    params->dilation_height_factor == 1 &&
                    params->dilation_width_factor == 1 &&
@@ -875,7 +936,7 @@ TfLiteStatus PreunpackConvEval(TfLiteContext* context, TfLiteNode* node) {
   // (= sample 6's 14 Conv2D layers, after serial is connected)
   const bool do_profile = (s_eval_count >= 85 && s_eval_count <= 98);
 
-  if (!data->is_int4) {
+  if (!data->is_int4 && !data->is_int2) {
     // ── INT8 path: call s8 kernel directly, no unpacking needed ──
     cmsis_nn_context ctx;
     if (data->scratch_buf_index >= 0) {
@@ -890,6 +951,54 @@ TfLiteStatus PreunpackConvEval(TfLiteContext* context, TfLiteNode* node) {
                             &filt_dims, filter_data,
                             &bias_dims, bias_data,
                             &out_dims, output_data);
+    return kTfLiteOk;
+  }
+
+  if (data->is_int2) {
+    // ── INT2 path: bulk unpack INT2 → INT8, then call s8 wrapper ──
+    // INT2 layers MUST go through bulk unpack: the fused 1×1 kernel is
+    // SBFX(4) based and doesn't know about 2-bit values, and CMSIS s4
+    // fallback would also misinterpret a 2-bit packed buffer.
+    if (!data->use_s8_fast) {
+      // Layer too large for the static scratch buffer. We could allocate
+      // a larger buffer, but for now keep this as a hard failure so it's
+      // obvious during bring-up. The largest INT2-eligible layer in our
+      // ablation set is layer 26 (512×512 PW = 256 KB int8) which exceeds
+      // the default 64 KB scratch. Bump PREUNPACK_SCRATCH_KB if you want
+      // INT2 on this layer.
+      return kTfLiteError;
+    }
+
+    auto t0 = TIMER_GetTimeInUS();
+
+    unpack_int2_to_int8(filter_data, s_preunpack_buf,
+                        data->weight_bytes_int8);
+
+    auto t1 = TIMER_GetTimeInUS();
+
+    cmsis_nn_context ctx;
+    if (data->scratch_buf_index >= 0) {
+      ctx.buf = context->GetScratchBuffer(context, data->scratch_buf_index);
+    } else {
+      ctx.buf = nullptr;
+    }
+    ctx.size = 0;
+
+    arm_convolve_wrapper_s8(&ctx, &conv_params, &quant_params,
+                            &in_dims, input_data,
+                            &filt_dims, s_preunpack_buf,
+                            &bias_dims, bias_data,
+                            &out_dims, output_data);
+
+    auto t2 = TIMER_GetTimeInUS();
+
+    if (do_profile) {
+      PRINTF("[PreUnpackI2] %dx%d c%d->%d  unpack=%dus  kernel=%dus  total=%dus  wt=%dB\r\n",
+             filter_h, filter_w, input_ch, output_ch,
+             (int)(t1-t0), (int)(t2-t1), (int)(t2-t0),
+             data->weight_bytes_int8);
+    }
+
     return kTfLiteOk;
   }
 
