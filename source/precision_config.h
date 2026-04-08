@@ -9,7 +9,7 @@
  * needs an explicit list of subgraph tensor indices that should be
  * treated as INT2.
  *
- * Source model: models/mobilenet_v1_cifar10/mobilenet_v1_cifar10_p1_L22_int2.tflite
+ * Source model: models/mobilenet_v1_cifar10/mobilenet_v1_cifar10_p1_L22_int2_dw8.tflite
  */
 
 #ifndef PRECISION_CONFIG_H_
